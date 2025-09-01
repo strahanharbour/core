@@ -1,0 +1,8 @@
+boto3
+duckdb
+polars
+pandas
+numpy
+yfinance
+streamlit
+pyarrow
