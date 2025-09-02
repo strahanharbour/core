@@ -1,5 +1,12 @@
-venv/
+# Virtual env and caches
+.venv/
 __pycache__/
-*.db
-*.pem
+.DS_Store
+
+# Local env and DB files
 .env
+*.db
+
+# Ignore src artifacts but keep placeholders
+src/main/artifacts/**
+!src/main/artifacts/**/.gitkeep

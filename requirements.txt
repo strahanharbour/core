@@ -4,5 +4,14 @@ polars
 pandas
 numpy
 yfinance
-streamlit
 pyarrow
+plotly
+pyyaml
+pytest
+rich
+streamlit
+requests
+vaderSentiment
+scikit-learn
+scipy
+python-dotenv

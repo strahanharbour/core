@@ -1,0 +1,26 @@
+universe: ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA"]
+paths:
+  data_dir: "artifacts/local_data"
+  features_dir: "artifacts/features"
+  results_dir: "artifacts/results"
+risk:
+  per_trade_dollar: 25
+  max_open_risk: 200
+  max_daily_loss_pct: 0.75
+backtest:
+  start: "2022-01-01"
+  end: "2025-08-31"
+  fee_bps: 1.0
+  slippage_bps: 3.0
+sentiment:
+  enable: false
+  sic_threshold: 0.0
+  decay_lambda: 0.05
+labels:
+  enable_triple_barrier: false
+  up_sigma: 2.0
+  down_sigma: 1.2
+  time_bar_days: 10
+portfolio:
+  enable_hrp: false
+  vol_target_annual: 0.15
