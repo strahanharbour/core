@@ -1,4 +1,4 @@
-from research.validation import walk_forward
+from main.research.validation import walk_forward
 
 
 def test_first_window_slices():

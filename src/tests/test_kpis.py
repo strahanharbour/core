@@ -1,6 +1,6 @@
 import math
 
-from engine.metrics.kpis import sharpe_ratio, sortino_ratio, equity_curve, max_drawdown, cvar
+from main.engine.metrics.kpis import sharpe_ratio, sortino_ratio, equity_curve, max_drawdown, cvar
 
 
 def test_kpis_run_on_simple_returns():

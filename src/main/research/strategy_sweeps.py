@@ -1,28 +1,22 @@
 from __future__ import annotations
-import itertools, contextlib
+import itertools
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
-from duckdb import df
 import polars as pl
 
 from config_env import load_cfg
 from constants import Col
-from engine import strategy as STRAT  # use your real strategy.py
 
-# -------- Grid you can tweak --------
+# ---- What we sweep (keep simple/orthogonal) ----
 DEFAULT_GRID = {
-    "rsi_cross_level":   [25.0, 30.0, 35.0],
-    "vol_mult_min":      [1.0, 1.1, 1.2],
-    "macd_hist_floor":   [0.0],
-    "lookback_bars":     [2, 3, 5],
-    "require_same_bar":  [False, True],
-    "require_macd_rising":[True, False],
-    "price_slack_bps":   [0.0, 2.0],
-    "entry_edge_lookback":[1, 3],        # how long to wait before allowing re-entry
+    "rsi_cross_level": [25.0, 30.0, 35.0],
+    "vol_mult_min":    [1.0, 1.1, 1.2],
+    "macd_hist_floor": [0.0],
 }
 
+# Exit horizon for quick scoring (not part of runtime)
 HOLD_BARS = 10
 MIN_WARM  = 30
 
@@ -31,63 +25,79 @@ class Params:
     rsi_cross_level: float
     vol_mult_min: float
     macd_hist_floor: float
-    lookback_bars: int
-    require_same_bar: bool
-    require_macd_rising: bool
-    price_slack_bps: float
-    entry_edge_lookback: int
 
 def _iter_grid(grid: Dict[str, List[Any]]) -> Iterable[Params]:
     keys = list(grid.keys())
     for combo in itertools.product(*[grid[k] for k in keys]):
         yield Params(**dict(zip(keys, combo)))
 
-@contextlib.contextmanager
-def _with_params(p: Dict[str, Any]):
-    """Temporarily override strategy._get_strategy_params() so STRAT.signal_rules() uses our grid values."""
-    orig = STRAT._get_strategy_params
-    try:
-        if hasattr(STRAT._get_strategy_params, "cache_clear"):
-            STRAT._get_strategy_params.cache_clear()
-        def _patched():
-            return {
-                "rsi_cross_level":     float(p["rsi_cross_level"]),
-                "vol_mult_min":        float(p["vol_mult_min"]),
-                "macd_hist_floor":     float(p["macd_hist_floor"]),
-                "atr_sizing_multiple": 1.2,  # not swept here
-                "lookback_bars":       int(p["lookback_bars"]),
-                "require_same_bar":    bool(p["require_same_bar"]),
-                "require_macd_rising": bool(p["require_macd_rising"]),
-                "price_slack_bps":     float(p["price_slack_bps"]),
-            }
-        STRAT._get_strategy_params = _patched  # type: ignore
-        yield
-    finally:
-        STRAT._get_strategy_params = orig      # type: ignore
-        if hasattr(STRAT._get_strategy_params, "cache_clear"):
-            STRAT._get_strategy_params.cache_clear()
+# --------- Sweep-only knobs pulled from config.strategy.sweep ---------
+@dataclass(frozen=True)
+class SweepKnobs:
+    lookback_bars: int
+    require_same_bar: bool
+    require_macd_rising: bool
+    price_slack_bps: float
+    entry_edge_lookback: int
+
+def _load_knobs() -> SweepKnobs:
+    meta = load_cfg()
+    cfg = meta.get("cfg", {}) or {}
+    sweep = ((cfg.get("strategy") or {}).get("sweep") or {})
+    return SweepKnobs(
+        lookback_bars       = int(sweep.get("lookback_bars", 5)),
+        require_same_bar    = bool(sweep.get("require_same_bar", False)),
+        require_macd_rising = bool(sweep.get("require_macd_rising", True)),
+        price_slack_bps     = float(sweep.get("price_slack_bps", 0.0)),
+        entry_edge_lookback = int(sweep.get("entry_edge_lookback", 3)),
+    )
+
+# --------- Local signal builder for sweeps (production stays strict) ---------
+def _signal_with_knobs(df: pl.DataFrame, p: Params, k: SweepKnobs) -> pl.Series:
+    """Build signal using sweep knobs (does NOT touch runtime engine.strategy)."""
+    need = [Col.RSI14.value, Col.MACD_HIST.value, Col.VWAP.value, Col.VOL_MULT.value, Col.CLOSE.value]
+    missing = [c for c in need if c not in df.columns]
+    if missing:
+        raise KeyError(f"missing columns: {missing}")
+
+    rsi   = pl.col(Col.RSI14.value)
+    hist  = pl.col(Col.MACD_HIST.value)
+    close = pl.col(Col.CLOSE.value)
+    vwap  = pl.col(Col.VWAP.value)
+    volm  = pl.col(Col.VOL_MULT.value)
+
+    cross_up = (rsi.shift(1) < p.rsi_cross_level) & (rsi >= p.rsi_cross_level)
+    if k.require_macd_rising:
+        macd_ok = (hist > p.macd_hist_floor) & (hist > hist.shift(1))
+    else:
+        macd_ok = (hist > p.macd_hist_floor)
+
+    slack = 1.0 - (k.price_slack_bps / 10_000.0)
+    price_ok = close >= (vwap * slack)
+    vol_ok   = volm >= p.vol_mult_min
+
+    if k.require_same_bar:
+        base = cross_up & macd_ok & price_ok & vol_ok
+    else:
+        L = max(1, int(k.lookback_bars))
+        base = (
+            cross_up.rolling_max(L).cast(pl.Boolean) &
+            macd_ok.rolling_max(L).cast(pl.Boolean) &
+            price_ok.rolling_max(L).cast(pl.Boolean) &
+            vol_ok.rolling_max(L).cast(pl.Boolean)
+        )
+
+    warm = max(MIN_WARM, int(k.lookback_bars))
+    idx  = pl.arange(0, df.height)
+    signal_expr = (base & (idx >= warm)).alias("signal")
+    return df.select(signal_expr)["signal"]
 
 def _entries_from_signal(sig: pl.Series, k_edge: int) -> pl.Series:
-    # normalize to boolean
     sig_b = sig.cast(pl.Boolean).fill_null(False)
+    prev_any = sig_b.shift(1).rolling_max(window_size=max(1, k_edge), min_samples=1).cast(pl.Boolean).fill_null(False)
+    return (sig_b & (~prev_any)).alias("entry")
 
-    # Convert to int to make rolling_max unambiguous across Polars versions
-    sig_i = sig_b.cast(pl.Int8)
-
-    # prior_any = max over last k_edge bars of *prior* signal
-    k = max(1, int(k_edge))
-    prior_any_i = (
-        sig_i.shift(1)
-             .rolling_max(window_size=k, min_samples=1)
-             .fill_null(0)
-    )
-    prior_any = (prior_any_i > 0).cast(pl.Boolean)
-
-    entries = (sig_b & (~prior_any)).alias("entry")
-    return entries
-
-
-def _eval_symbol(sym: str, p: Params, data_dir: Path, feat_dir: Path) -> pl.DataFrame | None:
+def _eval_symbol(sym: str, p: Params, knobs: SweepKnobs, data_dir: Path, feat_dir: Path) -> pl.DataFrame | None:
     f_feat = feat_dir / f"{sym}_features.parquet"
     f_data = data_dir / f"{sym}.parquet"
     if not f_feat.exists() or not f_data.exists():
@@ -97,36 +107,19 @@ def _eval_symbol(sym: str, p: Params, data_dir: Path, feat_dir: Path) -> pl.Data
     data  = pl.read_parquet(f_data).select([Col.DATE.value, Col.CLOSE.value])
     df = feats.join(data, on=Col.DATE.value, how="left").drop_nulls([Col.CLOSE.value])
 
-    with _with_params(p.__dict__):
-        sig = STRAT.signal_rules(df)  # uses your real strategy
-    ent = _entries_from_signal(sig, k_edge=max(1, int(p.entry_edge_lookback)))
-    df  = df.with_columns([sig.alias("signal"), ent])
+    sig = _signal_with_knobs(df, p, knobs)
+    ent = _entries_from_signal(sig, knobs.entry_edge_lookback)
 
-    # DEBUG: counts to verify sweep is seeing signals and entries
-    sig_cnt  = int(df["signal"].sum())
-    ent_cnt  = int(df["entry"].sum())
-    print(f"[DBG] {sym} sig={sig_cnt} ent={ent_cnt}  (edge={p.entry_edge_lookback}, lookback={p.lookback_bars}, same_bar={p.require_same_bar}, macd_rising={p.require_macd_rising}, vol_min={p.vol_mult_min}, slack_bps={p.price_slack_bps})")
-
-    if ent_cnt == 0 and sig_cnt > 0:
-        print(f"[DEBUG] {sym} sig>0 but 0 entries | k_edge={p.entry_edge_lookback} | "
-            f"lookback={p.lookback_bars} | same_bar={p.require_same_bar} | "
-            f"vol_min={p.vol_mult_min} | slack_bps={p.price_slack_bps}")
-    elif ent_cnt > 0:
-        print(f"[OK] {sym} signals={sig_cnt} entries={ent_cnt} params={p}")
-
-    # TEMP sanity: enter on signal (no edge)
-    ent = sig.cast(pl.Boolean).fill_null(False)
-    df  = df.with_columns([sig.alias("signal"), ent.alias("entry")])
-
-    # Compute exit indices/prices on the full frame, then filter to entries
+    # Compute exit indices on full frame, clamp within [0, n-1]
     n = df.height
-    # Clamp indices into [0, n-1] to avoid out-of-bounds in gather
     exit_idx = (pl.arange(0, n) + HOLD_BARS).clip(0, n - 1)
+
     df = df.with_columns([
-        pl.col(Col.CLOSE.value).gather(exit_idx).alias("_exit_px")
-    ])
-    df = df.with_columns([
-        (pl.col("_exit_px") / pl.col(Col.CLOSE.value) - 1.0).alias("ret_h")
+        sig.alias("signal"),
+        ent.alias("entry"),
+        pl.col(Col.CLOSE.value).gather(exit_idx).alias("_exit_px"),
+    ]).with_columns([
+        (pl.col("_exit_px") / pl.col(Col.CLOSE.value) - 1.0).alias("ret_h"),
     ])
 
     out = df.filter(pl.col("entry")).select([
@@ -138,22 +131,25 @@ def _eval_symbol(sym: str, p: Params, data_dir: Path, feat_dir: Path) -> pl.Data
     return out
 
 def main():
-    meta = load_cfg()
+    meta  = load_cfg()
     cfg   = meta.get("cfg", {}) or {}
     paths_abs = meta.get("paths_abs", {}) or {}
-    # Use resolved absolute paths for consistency with other scripts
-    data_dir = Path(paths_abs.get("data_dir") or Path(__file__).resolve().parents[2] / "main" / "artifacts" / "local_data")
-    feat_dir = Path(paths_abs.get("features_dir") or Path(__file__).resolve().parents[2] / "main" / "artifacts" / "features")
-    results_dir = Path(paths_abs.get("results_dir") or Path(__file__).resolve().parents[2] / "main" / "artifacts" / "results")
+
+    # Use resolved absolute paths (consistent with other scripts)
+    base = Path(__file__).resolve().parents[2]
+    data_dir = Path(paths_abs.get("data_dir") or base / "main" / "artifacts" / "local_data")
+    feat_dir = Path(paths_abs.get("features_dir") or base / "main" / "artifacts" / "features")
+    results_dir = Path(paths_abs.get("results_dir") or base / "main" / "artifacts" / "results")
     results_dir.mkdir(parents=True, exist_ok=True)
 
     universe = cfg.get("universe", ["SPY","QQQ","AAPL","MSFT","NVDA","TSLA"])
+    knobs    = _load_knobs()
 
     rows = []
     for p in _iter_grid(DEFAULT_GRID):
         per_sym = []
         for sym in universe:
-            r = _eval_symbol(sym, p, data_dir, feat_dir)
+            r = _eval_symbol(sym, p, knobs, data_dir, feat_dir)
             if r is not None and r.height > 0:
                 per_sym.append(r)
         if per_sym:
@@ -170,11 +166,11 @@ def main():
             "rsi_cross_level": p.rsi_cross_level,
             "vol_mult_min": p.vol_mult_min,
             "macd_hist_floor": p.macd_hist_floor,
-            "lookback_bars": p.lookback_bars,
-            "require_same_bar": p.require_same_bar,
-            "require_macd_rising": p.require_macd_rising,
-            "price_slack_bps": p.price_slack_bps,
-            "entry_edge_lookback": p.entry_edge_lookback,
+            "lookback_bars": knobs.lookback_bars,
+            "require_same_bar": knobs.require_same_bar,
+            "require_macd_rising": knobs.require_macd_rising,
+            "price_slack_bps": knobs.price_slack_bps,
+            "entry_edge_lookback": knobs.entry_edge_lookback,
             "trades": trades, "win_rate": round(win,4),
             "avg_ret": round(avg,6), "sharpe_like": round(sharpe,3),
         })
@@ -186,5 +182,4 @@ def main():
     print(res.head(20))
 
 if __name__ == "__main__":
-    print("USING strategy_sweeps with STRAT.signal_rules + _with_params ✅", flush=True)
     main()

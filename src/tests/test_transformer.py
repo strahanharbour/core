@@ -1,6 +1,6 @@
 import pandas as pd
 
-from data.pipelines.transformer import DataTransformer
+from main.data.pipelines.transformer import DataTransformer
 
 
 def test_transformer_drops_columns_and_stringifies_date():

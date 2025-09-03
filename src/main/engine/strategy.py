@@ -157,19 +157,27 @@ def signal_rules(df: Any) -> Any:
     return base.tolist()
 
 
-def position_size(atr: Any, risk_dollars: float = 25.0, atr_multiple: float | None = None) -> Any:
+def position_size(atr: Any, risk_dollars: float | None = None, atr_multiple: float | None = None) -> Any:
     """
     Position size as floor(risk_dollars / (k * ATR)), clipped at >= 0.
 
     k comes from config: strategy.atr_sizing_multiple (default 1.2)
+    risk_dollars defaults to config: risk.risk_dollars_per_trade (default 25.0)
 
     Accepts scalar, pandas Series, polars Series, or array-like.
     Returns int or a same-library Series/array of ints.
     """
+    # read ATR sizing multiple
     if atr_multiple is None:
         k = float(_get_strategy_params()["atr_sizing_multiple"])  # e.g., 1.2
     else:
         k = float(atr_multiple)
+
+    # read risk dollars from config if not provided
+    if risk_dollars is None:
+        risk_dollars = float(_get_risk_params()["risk_dollars_per_trade"])  # default 25.0
+    else:
+        risk_dollars = float(risk_dollars)
 
     if isinstance(atr, (int, float)):
         if atr <= 0:
@@ -208,10 +216,28 @@ def _get_strategy_params() -> dict[str, Any]:
         "vol_mult_min": float(strat.get("vol_mult_min", 1.2)),
         "macd_hist_floor": float(strat.get("macd_hist_floor", 0.0)),
         "atr_sizing_multiple": float(strat.get("atr_sizing_multiple", 1.2)),
+        # sweep/runtime extras (used by some callers)
         "lookback_bars": int(strat.get("lookback_bars", 3)),
         "require_same_bar": _as_bool(strat.get("require_same_bar", False)),
-        # optional nicety
         "price_slack_bps": float(strat.get("price_slack_bps", 0.0)),
+    }
+
+
+# Risk params loader
+@lru_cache(maxsize=1)
+def _get_risk_params() -> dict[str, float]:
+    """
+    Load risk knobs from config.yaml with defaults.
+      - risk.risk_dollars_per_trade (float)
+    """
+    try:
+        meta = load_cfg()
+        cfg = meta.get("cfg", {}) or {}
+        risk = cfg.get("risk", {}) or {}
+    except Exception:
+        risk = {}
+    return {
+        "risk_dollars_per_trade": float(risk.get("risk_dollars_per_trade", 25.0)),
     }
 
 def gated_entry(df: Any, sic_value: Any = None, use_sic: bool = False, sic_threshold: float = 0.0) -> Any:

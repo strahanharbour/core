@@ -1,8 +1,8 @@
 import os
 from pathlib import Path
 
-from oms import DBManager, OrderManager, TradeExecutor
-from engine.risk.manager import RiskManager
+from main.oms import DBManager, OrderManager, TradeExecutor
+from main.engine.risk.manager import RiskManager
 
 
 def test_trade_executor_deterministic(tmp_path: Path, monkeypatch):
