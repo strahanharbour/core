@@ -92,7 +92,8 @@ def main() -> None:
     if args.all_cols:
         view = df.head(args.rows)
     else:
-        base = [Col.DATE.value, Col.SYMBOL.value]
+        base_candidates = [Col.DATE.value, Col.SYMBOL.value, "price"]
+        base = [c for c in base_candidates if c in df.columns]
         cols = base + [c for c in feature_cols if c in df.columns]
         missing = [c for c in feature_cols if c not in df.columns]
         if missing:
@@ -108,4 +109,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

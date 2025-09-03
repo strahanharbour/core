@@ -21,6 +21,22 @@ labels:
   up_sigma: 2.0
   down_sigma: 1.2
   time_bar_days: 10
+features:
+  rsi_period: 14
+  atr_period: 14
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  vwap_window: 20
+  vol_mean_window: 20
 portfolio:
   enable_hrp: false
   vol_target_annual: 0.15
+strategy:
+  rsi_cross_level: 30.0
+  vol_mult_min: 1.2
+  macd_hist_floor: 0.0
+  lookback_bars: 3         
+  require_same_bar: false 
+  require_macd_rising: true
+  price_slack_bps: 0

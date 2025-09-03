@@ -20,16 +20,30 @@ def _build_equity_from_trades(trades: pl.DataFrame, start_equity: float = 10_000
         # Use a Python date object; pl.Date is a dtype, not a constructor
         return pl.DataFrame({"date": [_date(1970, 1, 1)], "equity": [start_equity]})
 
-    # Parse exit_date into Date and aggregate daily PnL
-    if trades.schema.get("exit_date") == pl.Utf8:
-        dates = pl.col("exit_date").str.strptime(pl.Date, strict=False, exact=False)
+    # Parse exit_date into Date and aggregate daily PnL (robust to dtype)
+    dt = trades.schema.get("exit_date")
+    if dt == pl.Utf8:
+        # Heuristic: if it contains a time (":"), parse as datetime with explicit format; else parse as date.
+        dates = (
+            pl.when(pl.col("exit_date").str.contains(":"))
+            .then(
+                pl.col("exit_date")
+                .str.to_datetime(format="%Y-%m-%d %H:%M:%S", strict=False, exact=False)
+                .dt.date()
+            )
+            .otherwise(
+                pl.col("exit_date").str.to_date(format="%Y-%m-%d", strict=False, exact=False)
+            )
+        )
+    elif dt == pl.Datetime:
+        dates = pl.col("exit_date").dt.date()
     else:
-        # Coerce any non-string datelike to Date
-        dates = pl.col("exit_date").cast(pl.Date)
+        # Coerce any non-string datelike to Date (nulls on failure)
+        dates = pl.col("exit_date").cast(pl.Date, strict=False)
 
     pnl_by_day = (
         trades.with_columns(dates.alias("date"))
-        .groupby("date", maintain_order=True)
+        .group_by("date", maintain_order=True)
         .agg(pl.col("pnl").sum().alias("pnl"))
         .sort("date")
     )
@@ -42,7 +56,7 @@ def _build_equity_from_trades(trades: pl.DataFrame, start_equity: float = 10_000
     daily = calendar.join(pnl_by_day, on="date", how="left").with_columns(
         pl.col("pnl").fill_null(0.0)
     )
-    equity = start_equity + daily.get_column("pnl").cumsum()
+    equity = start_equity + daily.get_column("pnl").cum_sum()
     return daily.select(["date"]).with_columns(equity.alias("equity"))
 
 

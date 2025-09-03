@@ -73,6 +73,10 @@ def main() -> None:
 
     trades: List[dict] = []
 
+    # Horizon for naive exit; reuse labels.time_bar_days if present
+    labels_cfg = cfg.get("labels", {})
+    horizon_days = int(labels_cfg.get("time_bar_days", 10))
+
     for sym in uni:
         df = _load_symbol_frames(sym, data_dir, feat_dir)
         if df is None:
@@ -100,7 +104,7 @@ def main() -> None:
         n = df.height
 
         for i in idxs:
-            j = min(i + 10, n - 1)
+            j = min(i + horizon_days, n - 1)
 
             c_in = close[i]
             c_out = close[j]
