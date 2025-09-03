@@ -21,7 +21,6 @@ def test_transformer_drops_columns_and_stringifies_date():
     out = DataTransformer().clean_data(df)
     assert "Dividends" not in out.columns
     assert "Stock Splits" not in out.columns and "Splits" not in out.columns
-    assert "Date" in out.columns
-    assert out["Date"].dtype == object
-    assert list(out["Date"]) == ["2024-01-01", "2024-01-02"]
-
+    assert "date" in out.columns
+    assert out["date"].dtype == object
+    assert list(out["date"]) == ["2024-01-01", "2024-01-02"]

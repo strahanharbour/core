@@ -3,90 +3,120 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Dict, List
+import re
 
 import polars as pl
 
 from config_env import load_cfg
+from constants import Col
+from utils.columns import canonicalize_polars_columns
 
 
 logger = logging.getLogger(__name__)
 
 
 FEATURE_COLS = [
-    "rsi14",
-    "atr14",
-    "macd",
-    "macd_signal",
-    "macd_hist",
-    "vwap",
-    "vol_mult",
+    Col.RSI14.value,
+    Col.ATR14.value,
+    Col.MACD.value,
+    Col.MACD_SIGNAL.value,
+    Col.MACD_HIST.value,
+    Col.VWAP.value,
+    Col.VOL_MULT.value,
 ]
 
 
+def _normalize_ohlcv_columns(df: pl.DataFrame) -> pl.DataFrame:
+    # Centralized canonicalization using humps
+    return canonicalize_polars_columns(df)
+
+
 def _compute_features(df: pl.DataFrame) -> pl.DataFrame:
-    # Expect columns: date, Open, High, Low, Close, Volume, symbol
-    required = {"date", "High", "Low", "Close", "Volume"}
+    # Expect columns: date, open, high, low, close, volume, symbol
+    df = _normalize_ohlcv_columns(df)
+    required = {Col.DATE.value, Col.HIGH.value, Col.LOW.value, Col.CLOSE.value, Col.VOLUME.value}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
 
-    df = df.sort("date")
+    df = df.sort(Col.DATE.value)
 
     # RSI(14) using Wilder smoothing via ewm_mean(alpha=1/14)
-    delta = (pl.col("Close") - pl.col("Close").shift(1)).alias("delta")
-    gain = pl.when(delta > 0).then(delta).otherwise(0.0).alias("gain")
-    loss = pl.when(delta < 0).then(-delta).otherwise(0.0).alias("loss")
-    avg_gain = pl.col("gain").ewm_mean(alpha=1 / 14, adjust=False).alias("avg_gain")
-    avg_loss = pl.col("loss").ewm_mean(alpha=1 / 14, adjust=False).alias("avg_loss")
-    rs = (pl.col("avg_gain") / pl.col("avg_loss")).alias("rs")
-    rsi14 = (100 - (100 / (1 + pl.col("rs")))).alias("rsi14")
+    # Note: with_columns evaluates expressions in parallel. Compute dependencies sequentially.
+    delta = (pl.col(Col.CLOSE.value) - pl.col(Col.CLOSE.value).shift(1)).alias("delta")
+    gain_expr = pl.when(pl.col("delta") > 0).then(pl.col("delta")).otherwise(0.0).alias("gain")
+    loss_expr = pl.when(pl.col("delta") < 0).then(-pl.col("delta")).otherwise(0.0).alias("loss")
 
     # ATR(14) via TR ewm_mean(alpha=1/14)
-    prev_close = pl.col("Close").shift(1)
-    tr = pl.max_horizontal([
-        (pl.col("High") - pl.col("Low")).abs(),
-        (pl.col("High") - prev_close).abs(),
-        (pl.col("Low") - prev_close).abs(),
+    prev_close = pl.col(Col.CLOSE.value).shift(1)
+    tr_expr = pl.max_horizontal([
+        (pl.col(Col.HIGH.value) - pl.col(Col.LOW.value)).abs(),
+        (pl.col(Col.HIGH.value) - prev_close).abs(),
+        (pl.col(Col.LOW.value) - prev_close).abs(),
     ]).alias("tr")
-    atr14 = pl.col("tr").ewm_mean(alpha=1 / 14, adjust=False).alias("atr14")
 
     # MACD (12,26,9)
-    ema12 = pl.col("Close").ewm_mean(span=12, adjust=False).alias("ema12")
-    ema26 = pl.col("Close").ewm_mean(span=26, adjust=False).alias("ema26")
-    macd = (pl.col("ema12") - pl.col("ema26")).alias("macd")
-    macd_signal = pl.col("macd").ewm_mean(span=9, adjust=False).alias("macd_signal")
-    macd_hist = (pl.col("macd") - pl.col("macd_signal")).alias("macd_hist")
+    ema12_expr = pl.col(Col.CLOSE.value).ewm_mean(span=12, adjust=False).alias("ema12")
+    ema26_expr = pl.col(Col.CLOSE.value).ewm_mean(span=26, adjust=False).alias("ema26")
 
     # VWAP (20-day rolling using typical price)
-    tp = ((pl.col("High") + pl.col("Low") + pl.col("Close")) / 3.0).alias("tp")
-    pv_roll = (pl.col("tp") * pl.col("Volume")).rolling_sum(window_size=20, min_periods=1)
-    v_roll = pl.col("Volume").rolling_sum(window_size=20, min_periods=1)
-    vwap = pl.when(v_roll == 0).then(None).otherwise(pv_roll / v_roll).alias("vwap")
+    tp_expr = ((pl.col(Col.HIGH.value) + pl.col(Col.LOW.value) + pl.col(Col.CLOSE.value)) / 3.0).alias("tp")
 
     # Volume multiplier vs 20-day mean
-    vol_mult = (pl.col("Volume") / pl.col("Volume").rolling_mean(window_size=20, min_periods=1)).alias("vol_mult")
+    # min_periods renamed to min_samples in Polars >= 1.21
+    vol_mult_expr = (
+        pl.col(Col.VOLUME.value)
+        / pl.col(Col.VOLUME.value).rolling_mean(window_size=20, min_samples=1)
+    ).alias(Col.VOL_MULT.value)
 
-    out = (
-        df.with_columns([
-            delta,
-            gain,
-            loss,
-            avg_gain,
-            avg_loss,
-            rs,
-            rsi14,
-            tr,
-            atr14,
-            ema12,
-            ema26,
-            macd,
-            macd_signal,
-            macd_hist,
-            tp,
-            vwap,
-            vol_mult,
-        ])
-        .select(["date", pl.col("symbol").cast(pl.Utf8).alias("symbol")] + [pl.col(c) for c in FEATURE_COLS])
+    # Build up columns in dependency order to avoid ColumnNotFound errors
+    out = df
+    # 1) RSI components: delta, gain, loss
+    out = out.with_columns([delta]).with_columns([gain_expr, loss_expr])
+    # 2) Wilder averages and RSI
+    out = out.with_columns([
+        pl.col("gain").ewm_mean(alpha=1 / 14, adjust=False).alias("avg_gain"),
+        pl.col("loss").ewm_mean(alpha=1 / 14, adjust=False).alias("avg_loss"),
+    ])
+    out = out.with_columns([
+        (pl.col("avg_gain") / pl.col("avg_loss")).alias("rs"),
+    ])
+    out = out.with_columns([
+        (100 - (100 / (1 + pl.col("rs")))).alias("rsi14"),
+    ])
+
+    # 3) ATR components
+    out = out.with_columns([tr_expr])
+    out = out.with_columns([pl.col("tr").ewm_mean(alpha=1 / 14, adjust=False).alias("atr14")])
+
+    # 4) MACD components
+    out = out.with_columns([ema12_expr, ema26_expr])
+    out = out.with_columns([(pl.col("ema12") - pl.col("ema26")).alias(Col.MACD.value)])
+    out = out.with_columns([
+        pl.col(Col.MACD.value).ewm_mean(span=9, adjust=False).alias(Col.MACD_SIGNAL.value)
+    ])
+    out = out.with_columns([
+        (pl.col(Col.MACD.value) - pl.col(Col.MACD_SIGNAL.value)).alias(Col.MACD_HIST.value)
+    ])
+
+    # 5) VWAP components
+    out = out.with_columns([tp_expr])
+    pv_roll = (pl.col("tp") * pl.col(Col.VOLUME.value)).rolling_sum(window_size=20, min_samples=1)
+    v_roll = pl.col(Col.VOLUME.value).rolling_sum(window_size=20, min_samples=1)
+    out = out.with_columns([
+        pl.when(v_roll == 0)
+        .then(None)
+        .otherwise(pv_roll / v_roll)
+        .alias(Col.VWAP.value)
+    ])
+
+    # 6) Volume multiplier
+    out = out.with_columns([vol_mult_expr])
+
+    # Final projection: date, symbol, features
+    out = out.select(
+        [Col.DATE.value, pl.col(Col.SYMBOL.value).cast(pl.Utf8).alias(Col.SYMBOL.value)]
+        + [pl.col(c) for c in FEATURE_COLS]
     )
 
     # Fail fast if any feature column is entirely null
@@ -101,8 +131,8 @@ def _compute_features(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def _symbol_from_df(df: pl.DataFrame, fallback: str) -> str:
-    if "symbol" in df.columns:
-        vals = df.get_column("symbol").drop_nans().drop_nulls().unique().to_list()
+    if Col.SYMBOL.value in df.columns:
+        vals = df.get_column(Col.SYMBOL.value).drop_nans().drop_nulls().unique().to_list()
         if len(vals) == 1 and isinstance(vals[0], str) and vals[0].strip():
             return vals[0].strip().upper()
     # fallback from filename
@@ -143,4 +173,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

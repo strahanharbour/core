@@ -5,6 +5,7 @@ pandas
 numpy
 yfinance
 pyarrow
+pyhumps
 plotly
 pyyaml
 pytest

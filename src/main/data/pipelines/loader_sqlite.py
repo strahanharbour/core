@@ -65,6 +65,7 @@ class DataLoader:
 
         # Normalize columns
         colmap = {
+            # Legacy
             "Date": "date",
             "Open": "open",
             "High": "high",
@@ -73,6 +74,14 @@ class DataLoader:
             "Adj Close": "adj_close",
             "Adj_Close": "adj_close",
             "Volume": "volume",
+            # Canonical camelCase
+            "date": "date",
+            "open": "open",
+            "high": "high",
+            "low": "low",
+            "close": "close",
+            "adjClose": "adj_close",
+            "volume": "volume",
         }
         use = {colmap[c]: df[c] for c in df.columns if c in colmap}
         rows = pd.DataFrame(use).to_records(index=False)
@@ -89,4 +98,3 @@ class DataLoader:
 
 
 __all__ = ["DataLoader"]
-

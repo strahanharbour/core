@@ -5,9 +5,12 @@ from pathlib import Path
 from typing import Dict
 
 import polars as pl
+import pandas as pd
 
 from config_env import load_cfg
 from data.market.extractor import DataExtractor
+from constants import Col
+from utils.columns import canonicalize_pandas_columns
 
 
 logger = logging.getLogger(__name__)
@@ -50,11 +53,12 @@ def main() -> None:
             continue
         # Reset index so Date becomes a column for parquet
         pdf = pdf.reset_index()
-        date_col = "Date" if "Date" in pdf.columns else pdf.columns[0]
-        if date_col != "date":
-            pdf = pdf.rename(columns={date_col: "date"})
+        # Canonicalize to camelCase across the board
+        pdf = canonicalize_pandas_columns(pdf)
+        if Col.DATE.value not in pdf.columns:
+            pdf = pdf.rename(columns={pdf.columns[0]: Col.DATE.value})
         pf = pl.from_pandas(pdf)
-        pf = pf.with_columns(pl.lit(sym).alias("symbol"))
+        pf = pf.with_columns(pl.lit(sym).alias(Col.SYMBOL.value))
         out_path = out_dir / f"{sym}.parquet"
         pf.write_parquet(out_path)
         written += 1

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from datetime import date as _date
 from typing import Dict
 
 import polars as pl
@@ -16,7 +17,8 @@ logger = logging.getLogger(__name__)
 def _build_equity_from_trades(trades: pl.DataFrame, start_equity: float = 10_000.0) -> pl.DataFrame:
     if trades.is_empty():
         # Produce a minimal 1-point equity curve at start equity
-        return pl.DataFrame({"date": [pl.Date("1970-01-01")], "equity": [start_equity]})
+        # Use a Python date object; pl.Date is a dtype, not a constructor
+        return pl.DataFrame({"date": [_date(1970, 1, 1)], "equity": [start_equity]})
 
     # Parse exit_date into Date and aggregate daily PnL
     if trades.schema.get("exit_date") == pl.Utf8:
@@ -79,4 +81,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

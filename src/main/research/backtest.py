@@ -9,6 +9,8 @@ import polars as pl
 
 from config_env import load_cfg
 from engine.strategy import gated_entry, position_size
+from constants import Col
+from utils.columns import canonicalize_polars_columns
 
 
 logger = logging.getLogger(__name__)
@@ -24,20 +26,18 @@ def _load_symbol_frames(sym: str, data_dir: Path, feat_dir: Path) -> pl.DataFram
         logger.warning("Missing features parquet for %s: %s", sym, feat_fp)
         return None
 
-    df_data = pl.read_parquet(data_fp)
-    df_feat = pl.read_parquet(feat_fp)
+    df_data = canonicalize_polars_columns(pl.read_parquet(data_fp))
+    df_feat = canonicalize_polars_columns(pl.read_parquet(feat_fp))
 
     # Ensure date column exists and types are comparable
-    if "date" not in df_data.columns:
+    if Col.DATE.value not in df_data.columns:
         raise KeyError(f"'date' column not found in data parquet for {sym}")
-    if "date" not in df_feat.columns:
+    if Col.DATE.value not in df_feat.columns:
         raise KeyError(f"'date' column not found in features parquet for {sym}")
 
     # Select only needed price columns to join
-    df_join = df_feat.join(
-        df_data.select(["date", "Close"]), on="date", how="left"
-    )
-    df_join = df_join.sort("date")
+    df_join = df_feat.join(df_data.select([Col.DATE.value, Col.CLOSE.value]), on=Col.DATE.value, how="left")
+    df_join = df_join.sort(Col.DATE.value)
     return df_join
 
 
@@ -94,9 +94,9 @@ def main() -> None:
             logger.info("%s: no entry signals", sym)
             continue
 
-        close = df.get_column("Close")
-        atr = df.get_column("atr14") if "atr14" in df.columns else None
-        dates = df.get_column("date")
+        close = df.get_column(Col.CLOSE.value)
+        atr = df.get_column(Col.ATR14.value) if Col.ATR14.value in df.columns else None
+        dates = df.get_column(Col.DATE.value)
         n = df.height
 
         for i in idxs:

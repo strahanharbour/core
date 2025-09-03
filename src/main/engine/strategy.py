@@ -4,6 +4,7 @@ from math import floor
 from typing import Any, Iterable
 
 import numpy as np
+from constants import Col
 
 try:
     import polars as pl  # type: ignore
@@ -45,17 +46,17 @@ def signal_rules(df: Any) -> Any:
     Works with Polars or Pandas DataFrame.
     Returns a Series of the same library type (pl.Series or pd.Series or list[bool]).
     """
-    cols = {"rsi14", "macd_hist", "vwap", "vol_mult", "Close"}
+    cols = {Col.RSI14.value, Col.MACD_HIST.value, Col.VWAP.value, Col.VOL_MULT.value, Col.CLOSE.value}
     missing = [c for c in cols if c not in set(df.columns)]
     if missing:
         raise KeyError(f"signal_rules missing columns: {missing}")
 
     if _is_polars_df(df):
-        rsi = pl.col("rsi14")
-        hist = pl.col("macd_hist")
-        close = pl.col("Close")
-        vwap = pl.col("vwap")
-        volm = pl.col("vol_mult")
+        rsi = pl.col(Col.RSI14.value)
+        hist = pl.col(Col.MACD_HIST.value)
+        close = pl.col(Col.CLOSE.value)
+        vwap = pl.col(Col.VWAP.value)
+        volm = pl.col(Col.VOL_MULT.value)
 
         cross_up = (rsi.shift(1) < 30) & (rsi >= 30)
         macd_ok = (hist > 0) & (hist > hist.shift(1))
@@ -65,11 +66,11 @@ def signal_rules(df: Any) -> Any:
         return df.with_columns(expr).get_column("signal").fill_null(False)
 
     if _is_pandas_df(df):
-        rsi = df["rsi14"]
-        hist = df["macd_hist"]
-        close = df["Close"]
-        vwap = df["vwap"]
-        volm = df["vol_mult"]
+        rsi = df[Col.RSI14.value]
+        hist = df[Col.MACD_HIST.value]
+        close = df[Col.CLOSE.value]
+        vwap = df[Col.VWAP.value]
+        volm = df[Col.VOL_MULT.value]
 
         signal = (
             (rsi.shift(1) < 30) & (rsi >= 30)
@@ -80,11 +81,11 @@ def signal_rules(df: Any) -> Any:
         return signal.fillna(False)
 
     # Fallback: try duck-typed columns supporting shift/comparison; return list of bool
-    rsi = df["rsi14"]
-    hist = df["macd_hist"]
-    close = df["Close"]
-    vwap = df["vwap"]
-    volm = df["vol_mult"]
+    rsi = df[Col.RSI14.value]
+    hist = df[Col.MACD_HIST.value]
+    close = df[Col.CLOSE.value]
+    vwap = df[Col.VWAP.value]
+    volm = df[Col.VOL_MULT.value]
     # Convert to numpy arrays with NaN handling
     rsi_a = np.asarray(rsi)
     hist_a = np.asarray(hist)
@@ -197,4 +198,3 @@ def gated_entry(df: Any, sic_value: Any = None, use_sic: bool = False, sic_thres
 
 
 __all__ = ["signal_rules", "position_size", "gated_entry"]
-

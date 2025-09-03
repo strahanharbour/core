@@ -11,6 +11,7 @@ from data.pipelines.transformer import DataTransformer
 from data.pipelines.loader_sqlite import DataLoader
 from engine.risk.manager import RiskManager
 from oms import DBManager, OrderManager, TradeExecutor, PortfolioManager
+from constants import Col
 
 
 START = "2022-01-01"
@@ -56,7 +57,8 @@ def run_etl_and_demo_orders() -> None:
         df = raw.get(sym)
         if df is None or df.empty:
             continue
-        last_close = float(df["Close"].dropna().iloc[-1])
+        clean = xform.clean_data(df)
+        last_close = float(clean[Col.CLOSE.value].dropna().iloc[-1])
         qty = 1  # simple demo sizing
         oid = om.create_order(sym, "BUY", qty, last_close, note="etl demo")
         if oid:
@@ -76,4 +78,3 @@ def run_etl_and_demo_orders() -> None:
 
 if __name__ == "__main__":
     run_etl_and_demo_orders()
-
