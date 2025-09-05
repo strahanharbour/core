@@ -16,3 +16,5 @@ vaderSentiment
 scikit-learn
 scipy
 python-dotenv
+
+plotly>=5
