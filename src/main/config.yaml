@@ -1,4 +1,27 @@
-universe: ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA"]
+universe:
+  - SPY
+  - QQQ
+  - AAPL
+  - MSFT
+  - NVDA
+  - TSLA
+  - META
+  - AMZN
+  - GOOGL
+  - JPM
+  - XOM
+  - UNH
+  - JNJ
+  - KO
+  - PFE
+  - IBM
+  - NFLX
+  - ORCL
+  - NKE
+  - V
+  - MA
+  - DIS
+
 paths:
   data_dir: "artifacts/local_data"
   features_dir: "artifacts/features"
