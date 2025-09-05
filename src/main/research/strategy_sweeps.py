@@ -14,12 +14,22 @@ import polars as pl
 
 from config_env import load_cfg
 from constants import Col
+from research.sim_lib import (
+    load_cfg_bits,
+    apply_sentiment_gate,
+    apply_market_filter,
+    strict_entry_edge,
+    exits_returns,
+)
 
 # ---- What we sweep (keep simple/orthogonal) ----
 DEFAULT_GRID = {
     "rsi_cross_level": [25.0, 30.0, 35.0],
     "vol_mult_min":    [1.0, 1.1, 1.2],
     "macd_hist_floor": [0.0],
+    # NEW sentiment toggles per combo:
+    "sic_enabled":     [False, True],
+    "sic_threshold":   [0.0, 0.1, 0.2],
 }
 
 # Exit horizon for quick scoring (not part of runtime)
@@ -31,6 +41,8 @@ class Params:
     rsi_cross_level: float
     vol_mult_min: float
     macd_hist_floor: float
+    sic_enabled: bool           # NEW
+    sic_threshold: float        # NEW
 
 def _iter_grid(grid: Dict[str, List[Any]]) -> Iterable[Params]:
     keys = list(grid.keys())
@@ -39,7 +51,10 @@ def _iter_grid(grid: Dict[str, List[Any]]) -> Iterable[Params]:
 
 
 def _label_for_params(p: Params) -> str:
-    s = f"rsi={p.rsi_cross_level}|vol={p.vol_mult_min}|macd={p.macd_hist_floor}"
+    s = (
+        f"rsi={p.rsi_cross_level}|vol={p.vol_mult_min}|macd={p.macd_hist_floor}"
+        f"|sic={'on' if p.sic_enabled else 'off'}@{p.sic_threshold}"
+    )
     h = hashlib.md5(s.encode()).hexdigest()[:6]
     return f"{s}#{h}"
 
@@ -105,6 +120,7 @@ def _signal_with_knobs(df: pl.DataFrame, p: Params, k: SweepKnobs) -> pl.Series:
     return df.select(signal_expr)["signal"]
 
 def _entries_from_signal(sig: pl.Series, k_edge: int) -> pl.Series:
+    # Retained for compatibility; not used after sim_lib strict edge wiring
     sig_b = sig.cast(pl.Boolean).fill_null(False)
     prev_any = sig_b.shift(1).rolling_max(window_size=max(1, k_edge), min_samples=1).cast(pl.Boolean).fill_null(False)
     return (sig_b & (~prev_any)).alias("entry")
@@ -142,85 +158,27 @@ def _eval_symbol(sym: str, p: Params, knobs: SweepKnobs, data_dir: Path, feat_di
     data  = pl.read_parquet(f_data).select([Col.DATE.value, Col.CLOSE.value])
     df = feats.join(data, on=Col.DATE.value, how="left").drop_nulls([Col.CLOSE.value])
 
+    # Build signal with knobs
     sig = _signal_with_knobs(df, p, knobs)
-    # Gate by Sentiment SIC if configured and available
-    try:
-        cfg = load_cfg()["cfg"]
-        sent = cfg.get("sentiment", {}) or {}
-        if bool(sent.get("enabled", False)):
-            sic_dir = feat_dir / "sentiment"
-            sic_file = sic_dir / f"{sym}_sic.parquet"
-            if sic_file.exists():
-                sic = pl.read_parquet(sic_file).select([Col.DATE.value, "sic"])
-                df = df.join(sic, on=Col.DATE.value, how="left")
-                sig = sig & (df.get_column("sic").fill_null(0.0) >= float(sent.get("sic_threshold", 0.1)))
-    except Exception:
-        # sentiment is optional; ignore issues
-        pass
-    # Apply global market filter if configured
-    try:
-        cfg = load_cfg()["cfg"]
-        mf = (cfg.get("strategy", {}).get("market_filter", {}) or {})
-        if bool(mf.get("enabled", False)):
-            from research._market_filter import load_market_ok
-            mkt = load_market_ok(data_dir, str(mf.get("symbol", "SPY")), int(mf.get("sma_length", 50)))
-            if mkt is not None:
-                df = df.join(mkt, on=Col.DATE.value, how="left")
-                sig = sig & df.get_column("mkt_ok").fill_null(False)
-    except Exception:
-        pass
-    ent = _entries_from_signal(sig, knobs.entry_edge_lookback)
-    exits = _load_exit_knobs()
-
-    df = df.with_columns([sig.alias("signal"), ent.alias("entry")])
-
-    if exits.enabled and ("atr14" in df.columns):
-        # Simulate per-entry stop/take over next N bars
-        idx = pl.arange(0, df.height).alias("idx")
-        df = df.with_columns(idx)
-        entries_df = df.filter(pl.col("entry")).select([Col.DATE.value, "idx", Col.CLOSE.value, "atr14"])
-        out_rows: list[dict[str, Any]] = []
-        for row in entries_df.iter_rows(named=True):
-            i0 = int(row["idx"])  # type: ignore[index]
-            px0 = float(row[Col.CLOSE.value])  # type: ignore[index]
-            atr0 = float(row["atr14"])  # type: ignore[index]
-            stop = px0 - exits.stop_atr_mult * atr0
-            take = px0 + exits.take_atr_mult * atr0
-            i_end = min(df.height - 1, i0 + exits.max_hold_bars)
-            ret = 0.0
-            hit = False
-            for i in range(i0 + 1, i_end + 1):
-                px = float(df[Col.CLOSE.value][i])
-                if px <= stop:
-                    ret = (stop / px0) - 1.0
-                    hit = True
-                    break
-                if px >= take:
-                    ret = (take / px0) - 1.0
-                    hit = True
-                    break
-            if not hit:
-                px_exit = float(df[Col.CLOSE.value][i_end])
-                ret = (px_exit / px0) - 1.0
-            out_rows.append({
-                "symbol": sym,
-                "entry_date": row[Col.DATE.value],
-                "entry_px": px0,
-                "ret_h": ret,
-            })
-        return pl.DataFrame(out_rows) if out_rows else None
-    else:
-        # Fallback fixed horizon
-        n = df.height
-        exit_idx = (pl.arange(0, n) + HOLD_BARS).clip(0, n - 1)
-        ret = (pl.col(Col.CLOSE.value).gather(exit_idx) / pl.col(Col.CLOSE.value) - 1.0).alias("ret_h")
-        out = df.filter(pl.col("entry")).select([
-            pl.lit(sym).alias("symbol"),
-            pl.col(Col.DATE.value).alias("entry_date"),
-            pl.col(Col.CLOSE.value).alias("entry_px"),
-            ret,
-        ])
-        return out
+    # Per-combo SIC gate (independent of global config toggles)
+    if p.sic_enabled:
+        sic_file = feat_dir / "sentiment" / f"{sym}_sic.parquet"
+        if sic_file.exists():
+            sic = pl.read_parquet(sic_file).select(["date", "sic"])
+            df = df.join(sic, on="date", how="left")
+            sig = sig & (df["sic"].fill_null(0.0) >= p.sic_threshold)
+    # Load cfg bits and apply sentiment + market gates
+    _, paths_cfg, sent_cfg, strat_cfg = load_cfg_bits()
+    sig = apply_sentiment_gate(df, sig, sym, feat_dir, sent_cfg)
+    sig = apply_market_filter(df, sig, data_dir, strat_cfg)
+    # Strict entry edge for consistency with backtest
+    ent = strict_entry_edge(sig)
+    # Compute returns using shared exits
+    trades = exits_returns(df, ent, strat_cfg)
+    if trades is not None and not trades.is_empty():
+        trades = trades.with_columns([pl.lit(sym).alias("symbol")])
+        return trades
+    return None
 
 
 def _equity_curve_for_combo(p: Params, knobs: SweepKnobs, universe: list[str], data_dir: Path, feat_dir: Path) -> pl.DataFrame:
@@ -261,92 +219,160 @@ def _equity_curve_for_combo(p: Params, knobs: SweepKnobs, universe: list[str], d
     curve = curve.with_columns(pl.lit(_label_for_params(p)).alias("label"))
     return curve
 
-def main():
-    meta  = load_cfg()
-    cfg   = meta.get("cfg", {}) or {}
-    paths_abs = meta.get("paths_abs", {}) or {}
+class StrategySweeper:
+    """Lightweight class wrapper around the sweep process.
 
-    # Use resolved absolute paths (consistent with other scripts)
-    base = Path(__file__).resolve().parents[2]
-    data_dir = Path(paths_abs.get("data_dir") or base / "main" / "artifacts" / "local_data")
-    feat_dir = Path(paths_abs.get("features_dir") or base / "main" / "artifacts" / "features")
-    results_dir = Path(paths_abs.get("results_dir") or base / "main" / "artifacts" / "results")
-    results_dir.mkdir(parents=True, exist_ok=True)
+    Encapsulates path resolution, grid iteration, and outputs (CSV + HTML + ranking).
+    """
 
-    universe = cfg.get("universe", ["SPY","QQQ","AAPL","MSFT","NVDA","TSLA"])
-    knobs    = _load_knobs()
+    def __init__(self) -> None:
+        meta = load_cfg()
+        self.cfg = meta.get("cfg", {}) or {}
+        paths_abs = meta.get("paths_abs", {}) or {}
+        base = Path(__file__).resolve().parents[2]
+        self.data_dir = Path(paths_abs.get("data_dir") or base / "main" / "artifacts" / "local_data")
+        self.feat_dir = Path(paths_abs.get("features_dir") or base / "main" / "artifacts" / "features")
+        self.results_dir = Path(paths_abs.get("results_dir") or base / "main" / "artifacts" / "results")
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+        self.universe = self.cfg.get("universe", ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA"])  # type: ignore[assignment]
+        self.knobs = _load_knobs()
 
-    rows = []
-    for p in _iter_grid(DEFAULT_GRID):
-        per_sym = []
-        for sym in universe:
-            r = _eval_symbol(sym, p, knobs, data_dir, feat_dir)
+    def _score_combo(self, p: Params) -> dict:
+        per_sym: list[pl.DataFrame] = []
+        for sym in self.universe:
+            r = _eval_symbol(sym, p, self.knobs, self.data_dir, self.feat_dir)
             if r is not None and r.height > 0:
                 per_sym.append(r)
         if per_sym:
             all_tr = pl.concat(per_sym, how="vertical_relaxed")
             trades = int(all_tr.height)
-            win    = float((all_tr["ret_h"] > 0).mean())
-            avg    = float(all_tr["ret_h"].mean())
-            std    = float(all_tr["ret_h"].std(ddof=1) or 0.0)
+            win = float((all_tr["ret_h"] > 0).mean())
+            avg = float(all_tr["ret_h"].mean())
+            std = float(all_tr["ret_h"].std(ddof=1) or 0.0)
             sharpe = (avg / std) * (252 / HOLD_BARS) ** 0.5 if std > 0 else 0.0
         else:
-            trades = 0; win = 0.0; avg = 0.0; sharpe = 0.0
+            trades = 0
+            win = 0.0
+            avg = 0.0
+            sharpe = 0.0
+        return {
+            "p": p,
+            "metrics": {
+                "trades": trades,
+                "win": win,
+                "avg": avg,
+                "sharpe": sharpe,
+            },
+        }
 
-        rows.append({
-            "rsi_cross_level": p.rsi_cross_level,
-            "vol_mult_min": p.vol_mult_min,
-            "macd_hist_floor": p.macd_hist_floor,
-            "lookback_bars": knobs.lookback_bars,
-            "require_same_bar": knobs.require_same_bar,
-            "require_macd_rising": knobs.require_macd_rising,
-            "price_slack_bps": knobs.price_slack_bps,
-            "entry_edge_lookback": knobs.entry_edge_lookback,
-            "trades": trades, "win_rate": round(win,4),
-            "avg_ret": round(avg,6), "sharpe_like": round(sharpe,3),
-        })
+    def _write_summary(self, rows: list[dict]) -> None:
+        res = pl.DataFrame(rows).sort(["trades", "sharpe_like", "win_rate"], descending=[True, True, True])
+        out_csv = self.results_dir / "param_sweep.csv"
+        res.write_csv(out_csv)
+        print(f"Saved: {out_csv}")
+        print(res.head(20))
 
-    res = pl.DataFrame(rows).sort(["trades","sharpe_like","win_rate"], descending=[True, True, True])
-    out_csv = results_dir / "param_sweep.csv"
-    res.write_csv(out_csv)
-    print(f"Saved: {out_csv}")
-    print(res.head(20))
-
-    # ---- New: multi-curve equity HTML ----
-    curves: list[pl.DataFrame] = []
-    for p in _iter_grid(DEFAULT_GRID):
-        curve = _equity_curve_for_combo(p, knobs, universe, data_dir, feat_dir)
-        if not curve.is_empty():
-            curves.append(curve)
-
-    out_html = results_dir / "sweep_equity.html"
-    if curves:
-        all_curves = pl.concat(curves, how="vertical_relaxed")
-        if go is None:
-            html = "<html><body><h3>Install plotly to see interactive chart: pip install plotly</h3></body></html>"
-            out_html.write_text(html, encoding="utf-8")
+    def _write_equity(self) -> None:
+        curves: list[pl.DataFrame] = []
+        for p in _iter_grid(DEFAULT_GRID):
+            curve = _equity_curve_for_combo(p, self.knobs, self.universe, self.data_dir, self.feat_dir)
+            if not curve.is_empty():
+                curves.append(curve)
+        out_html = self.results_dir / "sweep_equity.html"
+        if curves:
+            all_curves = pl.concat(curves, how="vertical_relaxed")
+            if go is None:
+                html = "<html><body><h3>Install plotly to see interactive chart: pip install plotly</h3></body></html>"
+                out_html.write_text(html, encoding="utf-8")
+            else:
+                fig = go.Figure()
+                labels = all_curves["label"].unique().to_list()
+                for label in labels:
+                    g = all_curves.filter(pl.col("label") == label).sort("date")
+                    fig.add_trace(
+                        go.Scatter(
+                            x=g["date"].to_list(),
+                            y=g["equity"].to_list(),
+                            mode="lines",
+                            name=label,
+                        )
+                    )
+                fig.update_layout(
+                    title=f"Sweep Equity Curves ({datetime.now().strftime('%Y-%m-%d')})",
+                    xaxis_title="Date",
+                    yaxis_title="Equity (start=1.0)",
+                    hovermode="x unified",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                )
+                fig.write_html(out_html, include_plotlyjs="cdn")
+                print(f"Saved: {out_html}")
         else:
-            fig = go.Figure()
-            labels = all_curves["label"].unique().to_list()
-            for label in labels:
-                g = all_curves.filter(pl.col("label") == label).sort("date")
-                fig.add_trace(go.Scatter(
-                    x=g["date"].to_list(),
-                    y=g["equity"].to_list(),
-                    mode="lines",
-                    name=label,
-                ))
-            fig.update_layout(
-                title=f"Sweep Equity Curves ({datetime.now().strftime('%Y-%m-%d')})",
-                xaxis_title="Date",
-                yaxis_title="Equity (start=1.0)",
-                hovermode="x unified",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+            out_html.write_text("<html><body><h3>No trades in sweep to plot.</h3></body></html>", encoding="utf-8")
+
+    def _rank(self) -> None:
+        try:
+            from research.rank_strategies import StrategyRanker
+
+            ranked = StrategyRanker(self.results_dir).rank()
+            out_rank_csv = self.results_dir / "ranked_strategies.csv"
+            ranked.write_csv(out_rank_csv)
+            # Quick top report
+            sel_cols = [
+                "rsi_cross_level",
+                "vol_mult_min",
+                "macd_hist_floor",
+                "trades",
+                "win_rate",
+                "avg_ret",
+                "sharpe_like",
+                "max_drawdown",
+                "oos_ratio",
+                "stability",
+                "score",
+            ]
+            if "sic_enabled" in ranked.columns:
+                sel_cols.insert(3, "sic_enabled")
+            if "sic_threshold" in ranked.columns:
+                sel_cols.insert(4, "sic_threshold")
+            top = ranked.select([c for c in sel_cols if c in ranked.columns]).head(10)
+            (self.results_dir / "rank_report.md").write_text(str(top), encoding="utf-8")
+            print(f"Saved: {out_rank_csv}")
+        except Exception as e:
+            print(f"Ranking step skipped: {e}")
+
+    def run(self) -> None:
+        rows: list[dict] = []
+        for p in _iter_grid(DEFAULT_GRID):
+            sc = self._score_combo(p)
+            metrics = sc["metrics"]
+            rows.append(
+                {
+                    "rsi_cross_level": p.rsi_cross_level,
+                    "vol_mult_min": p.vol_mult_min,
+                    "macd_hist_floor": p.macd_hist_floor,
+                    "sic_enabled": p.sic_enabled,
+                    "sic_threshold": p.sic_threshold,
+                    "lookback_bars": self.knobs.lookback_bars,
+                    "require_same_bar": self.knobs.require_same_bar,
+                    "require_macd_rising": self.knobs.require_macd_rising,
+                    "price_slack_bps": self.knobs.price_slack_bps,
+                    "entry_edge_lookback": self.knobs.entry_edge_lookback,
+                    "trades": int(metrics["trades"]),
+                    "win_rate": round(float(metrics["win"]), 4),
+                    "avg_ret": round(float(metrics["avg"]), 6),
+                    "sharpe_like": round(float(metrics["sharpe"]), 3),
+                }
             )
-            fig.write_html(out_html, include_plotlyjs="cdn")
-            print(f"Saved: {out_html}")
-    else:
-        out_html.write_text("<html><body><h3>No trades in sweep to plot.</h3></body></html>", encoding="utf-8")
+
+        self._write_summary(rows)
+        self._write_equity()
+        self._rank()
+
+
+def main():
+    sweeper = StrategySweeper()
+    sweeper.run()
+
 
 if __name__ == "__main__":
     main()

@@ -134,3 +134,19 @@ Expected outputs
 - `src/main/artifacts/features/{SYMBOL}_features.parquet`
 - `src/main/artifacts/results/trades.parquet`
 - `src/main/artifacts/results/equity.html`
+
+### Rank strategies
+```powershell
+$env:PYTHONPATH = (Resolve-Path .\src\main).Path
+\.venv\Scripts\python.exe -m research.strategy_sweeps
+\.venv\Scripts\python.exe -m research.rank_strategies
+
+
+Outputs:
+
+src/main/artifacts/results/param_sweep.csv
+
+src/main/artifacts/results/ranked_strategies.csv
+
+src/main/artifacts/results/rank_report.md
+```

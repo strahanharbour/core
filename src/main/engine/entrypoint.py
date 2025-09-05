@@ -2,13 +2,14 @@ from __future__ import annotations
 import argparse, json, logging, os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Protocol, runtime_checkable, Literal, Union, cast
 
 import polars as pl
 
 from config_env import load_cfg
 from constants import Col
 from engine.strategy import signal_rules, position_size
+from constants import AllocatorType
 
 # -------- logging --------
 def _setup_logging(results_dir: Path) -> None:
@@ -65,6 +66,16 @@ class PaperOMS:
         logging.info(f"FILLED (paper): {fill}")
         return fill
 
+# ---- OMS Protocols (typing) ----
+@runtime_checkable
+class _PaperOMSProto(Protocol):
+    def place(self, order: "PaperOrder") -> Dict[str, Any]: ...
+
+
+@runtime_checkable
+class _RealOMSProto(Protocol):
+    def create_order(self, symbol: str, side: str, qty: int, price: float, note: Optional[str] = None) -> Optional[int]: ...
+
 # -------- helpers --------
 def _load_cfg_paths(cfg: Dict[str, Any]) -> Dict[str, Path]:
     paths = cfg.get("paths", {}) or {}
@@ -102,14 +113,27 @@ def _choose_qty(df: pl.DataFrame, risk_dollars: Optional[float] = None) -> int:
         return max(qty, 0)
     return 1  # ultra-conservative fallback
 
-def _maybe_import_real_oms():
-    """Try to use your project's OMS/OrderManager if available; else PaperOMS."""
+def _build_oms(results_dir: Path) -> tuple[Literal["om", "paper"], Union[_RealOMSProto, _PaperOMSProto]]:
+    """Return an instantiated OMS. Prefer real OrderManager; fallback to PaperOMS.
+
+    This avoids type-checker confusion over constructor signatures.
+    """
+    # Try canonical package path first, then local import fallback
     try:
-        # Attempt to import an existing OMS adapter
-        from order_manager import OrderManager  # type: ignore
-        return ("om", OrderManager)  # your code can adapt constructor below
+        try:
+            from oms.order_manager import OrderManager  # type: ignore
+            from oms.db_manager import DBManager  # type: ignore
+            from engine.risk.manager import RiskManager  # type: ignore
+        except Exception:
+            from order_manager import OrderManager  # type: ignore
+            from db_manager import DBManager  # type: ignore
+            from engine.risk.manager import RiskManager  # type: ignore
+        db = DBManager()
+        risk = RiskManager()
+        return ("om", cast(_RealOMSProto, OrderManager(db=db, risk=risk)))
     except Exception:
-        return ("paper", PaperOMS)
+        state_dir = results_dir / "state"
+        return ("paper", cast(_PaperOMSProto, PaperOMS(state_dir)))
 
 # -------- main run --------
 def run(asof: Optional[str] = None, dry_run: bool = False) -> None:
@@ -120,12 +144,13 @@ def run(asof: Optional[str] = None, dry_run: bool = False) -> None:
 
     universe = cfg.get("universe", ["SPY","QQQ","AAPL","MSFT","NVDA","TSLA"])
     port_cfg = (cfg.get("portfolio") or {})
-    alloc = str(port_cfg.get("allocator", "equal")).lower()
+    try:
+        alloc = AllocatorType(str(port_cfg.get("allocator", "equal")).lower())
+    except Exception:
+        alloc = AllocatorType.EQUAL
     maxn = int(port_cfg.get("max_positions", 5))
 
-    oms_kind, OMSClass = _maybe_import_real_oms()
-    state_dir = paths["results"] / "state"
-    oms = OMSClass(state_dir) if oms_kind == "paper" else OMSClass()  # adjust if your OrderManager needs args
+    oms_kind, oms = _build_oms(paths["results"])  # already instantiated
     logging.info(f"Entrypoint start | OMS={oms_kind} | dry_run={dry_run}")
 
     # Collect candidate entries with a basic strength score
@@ -155,10 +180,10 @@ def run(asof: Optional[str] = None, dry_run: bool = False) -> None:
         return
 
     picks = candidates.sort(by="strength", descending=True).head(maxn)
-    if alloc == "equal" or alloc not in ("hrp",):
+    if alloc == AllocatorType.EQUAL:
         w = 1.0 / max(1, picks.height)
         picks = picks.with_columns(pl.lit(w).alias("weight"))
-    elif alloc == "hrp":
+    elif alloc == AllocatorType.HRP:
         # Placeholder: map to equal weight until HRP pipeline is wired
         w = 1.0 / max(1, picks.height)
         picks = picks.with_columns(pl.lit(w).alias("weight"))
@@ -174,16 +199,16 @@ def run(asof: Optional[str] = None, dry_run: bool = False) -> None:
             logging.info(f"{sym}: weight={row.get('weight', 0.0):.3f} but qty=0 (skip)")
             continue
         last_close = float(row["last_close"]) if row["last_close"] is not None else float(df.get_column(Col.CLOSE.value).tail(1).item())
-        note = f"entry-on-signal weight={row.get('weight', 0.0):.3f} alloc={alloc}"
+        note = f"entry-on-signal weight={row.get('weight', 0.0):.3f} alloc={alloc.value}"
         order = PaperOrder(symbol=sym, side="BUY", qty=qty, price=last_close, note=note)
         if dry_run:
             logging.info(f"DRY RUN order: {order}")
         else:
             if oms_kind == "paper":
-                oms.place(order)  # PaperOMS
+                cast(_PaperOMSProto, oms).place(order)  # PaperOMS
             else:
                 try:
-                    oms.place_order(symbol=sym, side="BUY", quantity=qty, price=last_close)  # type: ignore
+                    cast(_RealOMSProto, oms).create_order(symbol=sym, side="BUY", qty=qty, price=last_close, note=note)
                 except Exception:
                     logging.info(f"{sym}: real OMS not wired; logging only: {order}")
 

@@ -8,7 +8,17 @@ from typing import Dict, List
 import polars as pl
 
 from config_env import load_cfg
-from engine.strategy import gated_entry, position_size
+from engine.strategy import position_size
+from utils.paths import get_paths
+from utils.polars_ext import join_on_date
+from research.sim_lib import (
+    load_cfg_bits,
+    apply_sentiment_gate,
+    apply_market_filter,
+    strict_entry_edge,
+    exits_returns,
+    signal_rules,
+)
 from constants import Col
 from utils.columns import canonicalize_polars_columns
 
@@ -41,261 +51,128 @@ def _load_symbol_frames(sym: str, data_dir: Path, feat_dir: Path) -> pl.DataFram
     return df_join
 
 
-def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+class Backtester:
+    """Encapsulated backtest runner for daily, long-only signals.
 
-    meta = load_cfg()
-    cfg = meta["cfg"]
-    paths_abs: Dict[str, str] = meta["paths_abs"]
+    Keeps existing behavior: writes trades.parquet and prints a summary JSON.
+    """
 
-    data_dir = Path(paths_abs["data_dir"])  # absolute
-    feat_dir = Path(paths_abs["features_dir"])  # absolute
-    res_dir = Path(paths_abs["results_dir"])  # absolute
-    res_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(self) -> None:
+        meta = load_cfg()
+        self.cfg: Dict = meta.get("cfg", {}) or {}
+        self.paths = get_paths()
+        # Slippage/fees
+        bt = self.cfg.get("backtest", {})
+        self.slip = float(bt.get("slippage_bps", 0.0)) / 1e4
+        self.fee = float(bt.get("fee_bps", 0.0)) / 1e4
+        # Risk sizing dollars
+        risk = self.cfg.get("risk", {})
+        self.risk_dollars = float(risk.get("per_trade_dollar", 25.0))
+        # Config bits for gates/exits
+        _, self.paths_cfg, self.sent_cfg, self.strat_cfg = load_cfg_bits()
+        # Universe
+        self.universe = [str(s).upper() for s in self.cfg.get("universe", [])]
+        self.results_dir = self.paths.results
+        self.results_dir.mkdir(parents=True, exist_ok=True)
 
-    bt = cfg.get("backtest", {})
-    slip_bps = float(bt.get("slippage_bps", 0.0))
-    fee_bps = float(bt.get("fee_bps", 0.0))
-    slip = slip_bps / 1e4
-    fee = fee_bps / 1e4
+    def _load_df(self, sym: str) -> pl.DataFrame | None:
+        return _load_symbol_frames(sym, self.paths.data, self.paths.features)
 
-    risk = cfg.get("risk", {})
-    risk_dollars = float(risk.get("per_trade_dollar", 25.0))
-
-    senti = cfg.get("sentiment", {})
-    # Support both 'enabled' and legacy 'enable'
-    use_sic = bool(senti.get("enabled", senti.get("enable", False)))
-    sic_threshold = float(senti.get("sic_threshold", 0.0))
-
-    uni = [str(s).upper() for s in cfg.get("universe", [])]
-    if not uni:
-        logger.error("Universe is empty; aborting")
-        return
-
-    trades: List[dict] = []
-
-    # Horizon for naive exit; reuse labels.time_bar_days if present
-    labels_cfg = cfg.get("labels", {})
-    horizon_days = int(labels_cfg.get("time_bar_days", 10))
-
-    for sym in uni:
-        df = _load_symbol_frames(sym, data_dir, feat_dir)
-        if df is None:
-            continue
-
-        # Generate entry signals (Polars)
-        sic_col = "sic" if "sic" in df.columns else None
-        signal = gated_entry(
-            df,
-            sic_value=sic_col if sic_col else 0.0,
-            use_sic=use_sic,
-            sic_threshold=sic_threshold,
+    def _pnl_from_trades(self, sym: str, df: pl.DataFrame, trades_df: pl.DataFrame) -> List[dict]:
+        out: List[dict] = []
+        df_idx = df.with_columns(pl.arange(0, pl.len()).alias("idx"))
+        trades_j = join_on_date(
+            trades_df,
+            df_idx.select([Col.DATE.value, "idx", Col.ATR14.value]),
+            left_on="entry_date",
+            right_on=Col.DATE.value,
+            how="left",
         )
+        ex_cfg = (self.strat_cfg.get("exits") or {})
+        max_h = int(ex_cfg.get("max_hold_bars", 10))
+        for row in trades_j.iter_rows(named=True):
+            entry_date = row["entry_date"]
+            entry_px = float(row["entry_px"]) if row["entry_px"] is not None else None
+            ret_h = float(row["ret_h"]) if row["ret_h"] is not None else None
+            i0 = int(row.get("idx") or -1)
+            atr_i = row.get(Col.ATR14.value)
+            if entry_px is None or ret_h is None or atr_i is None:
+                continue
+            try:
+                qty = int(position_size(float(atr_i), risk_dollars=self.risk_dollars))
+            except Exception:
+                qty = 0
+            if qty <= 0:
+                continue
+            entry_price = entry_px * (1.0 + self.slip)
+            exit_price = entry_px * (1.0 + ret_h) * (1.0 - self.fee)
+            fees_cost = self.fee * entry_price * qty + self.fee * exit_price * qty
+            pnl = (exit_price - entry_price) * qty - fees_cost
+            exit_idx = i0 + max_h if i0 >= 0 else i0
+            out.append(
+                {
+                    "symbol": sym,
+                    "entry_idx": i0,
+                    "exit_idx": exit_idx,
+                    "entry": entry_price,
+                    "exit": exit_price,
+                    "qty": qty,
+                    "pnl": pnl,
+                    "entry_date": str(entry_date),
+                    "exit_date": str(entry_date),
+                }
+            )
+        return out
 
-        # Optional: Global market filter (strategy.market_filter)
-        try:
-            mf = (cfg.get("strategy", {}).get("market_filter", {}) or {})
-            if bool(mf.get("enabled", False)):
-                from research._market_filter import load_market_ok
-                # Prefer absolute paths from config_env
-                data_dir_for_mf = Path(paths_abs.get("data_dir") or "src/main/artifacts/local_data")
-                mkt = load_market_ok(data_dir_for_mf, str(mf.get("symbol", "SPY")), int(mf.get("sma_length", 50)))
-                if mkt is not None:
-                    df = df.join(mkt, on="date", how="left")
-                    signal = signal & df.get_column("mkt_ok").fill_null(False)
-        except Exception:
-            pass
+    def run(self) -> None:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+        if not self.universe:
+            logger.error("Universe is empty; aborting")
+            return
+        trades: List[dict] = []
+        for sym in self.universe:
+            df = self._load_df(sym)
+            if df is None:
+                continue
+            sig = signal_rules(df)
+            features_dir = Path(self.paths_cfg.get("features_dir", str(self.paths.features)))
+            data_dir_for_mf = Path(self.paths_cfg.get("data_dir", str(self.paths.data)))
+            sig = apply_sentiment_gate(df, sig, sym, features_dir, self.sent_cfg)
+            sig = apply_market_filter(df, sig, data_dir_for_mf, self.strat_cfg)
+            entries = strict_entry_edge(sig)
+            trades_df = exits_returns(df, entries, self.strat_cfg)
+            if trades_df is None or trades_df.is_empty():
+                logger.info("%s: no entry signals", sym)
+                continue
+            trades.extend(self._pnl_from_trades(sym, df, trades_df))
 
-        # Optional: Gate by SIC from features/sentiment if enabled in config
-        try:
-            _cfg = load_cfg()["cfg"]
-            _sent = _cfg.get("sentiment", {}) or {}
-            _feat_dir = Path((_cfg.get("paths") or {}).get("features_dir", "src/main/artifacts/features"))
-            if bool(_sent.get("enabled", False)):
-                sic_dir = _feat_dir / "sentiment"
-                sic_file = sic_dir / f"{sym}_sic.parquet"
-                if sic_file.exists():
-                    sic = pl.read_parquet(sic_file).select(["date", "sic"])
-                    df = df.join(sic, on="date", how="left")
-                    threshold = float(_sent.get("sic_threshold", 0.1))
-                    signal = signal & (df.get_column("sic").fill_null(0.0) >= threshold)
-        except Exception:
-            # Do not break backtests if sentiment files are missing/malformed
-            pass
-        # signal is a pl.Series aligned to df
-        sig_series = signal if isinstance(signal, pl.Series) else pl.Series(values=signal)
-        idxs = [i for i, v in enumerate(sig_series) if bool(v)]
-
-        if not idxs:
-            logger.info("%s: no entry signals", sym)
-            continue
-
-        close = df.get_column(Col.CLOSE.value)
-        atr = df.get_column(Col.ATR14.value) if Col.ATR14.value in df.columns else None
-        dates = df.get_column(Col.DATE.value)
-        n = df.height
-
-        # Exits: ATR-based when enabled; otherwise fixed-horizon fallback
-        ex = (cfg.get("strategy", {}).get("exits", {}) or {})
-        use_atr_exits = bool(ex.get("enabled", False)) and (Col.ATR14.value in df.columns)
-        if use_atr_exits:
-            stop_k = float(ex.get("stop_atr_mult", 2.0))
-            take_k = float(ex.get("take_atr_mult", 3.0))
-            max_h  = int(ex.get("max_hold_bars", 10))
-            for i0 in idxs:
-                c_in = close[i0]
-                if c_in is None:
-                    continue
-                try:
-                    px0 = float(c_in)
-                except Exception:
-                    continue
-
-                # Get ATR for sizing
-                atr_i = None
-                if atr is not None:
-                    atr_i = atr[i0]
-                if atr_i is None:
-                    qty = 0
-                    atr0 = None
-                else:
-                    try:
-                        atr0 = float(atr_i)
-                        qty = int(position_size(atr0, risk_dollars=risk_dollars))
-                    except Exception:
-                        qty = 0
-                        atr0 = None
-                if qty <= 0 or atr0 is None:
-                    continue
-
-                stop = px0 - stop_k * atr0
-                take = px0 + take_k * atr0
-                i_end = min(n - 1, i0 + max_h)
-                ret = 0.0
-                exit_idx = i_end
-                hit = False
-                for i in range(i0 + 1, i_end + 1):
-                    px = close[i]
-                    if px is None:
-                        continue
-                    try:
-                        px_f = float(px)
-                    except Exception:
-                        continue
-                    if px_f <= stop:
-                        ret = (stop / px0) - 1.0
-                        exit_idx = i
-                        hit = True
-                        break
-                    if px_f >= take:
-                        ret = (take / px0) - 1.0
-                        exit_idx = i
-                        hit = True
-                        break
-                if not hit:
-                    # exit at last bar of max_hold window
-                    px_exit = close[i_end]
-                    if px_exit is None:
-                        continue
-                    try:
-                        ret = (float(px_exit) / px0) - 1.0
-                    except Exception:
-                        continue
-
-                # Realized prices with slippage
-                entry_price = px0 * (1.0 + slip)
-                exit_price  = px0 * (1.0 + ret) * (1.0 - slip)
-                fees_cost = fee * entry_price * qty + fee * exit_price * qty
-                pnl = (exit_price - entry_price) * qty - fees_cost
-
-                trades.append(
-                    {
-                        "symbol": sym,
-                        "entry_idx": i0,
-                        "exit_idx": exit_idx,
-                        "entry": entry_price,
-                        "exit": exit_price,
-                        "qty": qty,
-                        "pnl": pnl,
-                        "entry_date": str(dates[i0]),
-                        "exit_date": str(dates[exit_idx]),
-                    }
-                )
+        out_path = self.results_dir / "trades.parquet"
+        if trades:
+            df_trades = pl.DataFrame(trades)
+            df_trades.write_parquet(out_path)
+            total_pnl = float(df_trades.get_column("pnl").sum())
+            final_equity = 10_000.0 + total_pnl
+            print(json.dumps({"trades": df_trades.height, "final_equity": round(final_equity, 2)}))
         else:
-            for i in idxs:
-                j = min(i + horizon_days, n - 1)
+            empty = pl.DataFrame(
+                schema={
+                    "symbol": pl.Utf8,
+                    "entry_idx": pl.Int64,
+                    "exit_idx": pl.Int64,
+                    "entry": pl.Float64,
+                    "exit": pl.Float64,
+                    "qty": pl.Int64,
+                    "pnl": pl.Float64,
+                    "entry_date": pl.Utf8,
+                    "exit_date": pl.Utf8,
+                }
+            )
+            empty.write_parquet(out_path)
+            print(json.dumps({"trades": 0, "final_equity": 10_000.0}))
 
-                c_in = close[i]
-                c_out = close[j]
-                if c_in is None or c_out is None:
-                    continue
-                try:
-                    c_in_f = float(c_in)
-                    c_out_f = float(c_out)
-                except Exception:
-                    continue
 
-                # Get ATR for sizing; skip if missing/nonpositive
-                atr_i = None
-                if atr is not None:
-                    atr_i = atr[i]
-                if atr_i is None:
-                    qty = 0
-                else:
-                    try:
-                        qty = int(position_size(float(atr_i), risk_dollars=risk_dollars))
-                    except Exception:
-                        qty = 0
-                if qty <= 0:
-                    continue
-
-                entry_price = c_in_f * (1.0 + slip)
-                exit_price = c_out_f * (1.0 - slip)
-
-                fees_cost = fee * entry_price * qty + fee * exit_price * qty
-                pnl = (exit_price - entry_price) * qty - fees_cost
-
-                entry_date = str(dates[i])
-                exit_date = str(dates[j])
-
-                trades.append(
-                    {
-                        "symbol": sym,
-                        "entry_idx": i,
-                        "exit_idx": j,
-                        "entry": entry_price,
-                        "exit": exit_price,
-                        "qty": qty,
-                        "pnl": pnl,
-                        "entry_date": entry_date,
-                        "exit_date": exit_date,
-                    }
-                )
-
-    # Persist trades and print summary
-    if trades:
-        df_trades = pl.DataFrame(trades)
-        out_path = res_dir / "trades.parquet"
-        df_trades.write_parquet(out_path)
-        total_pnl = float(df_trades.get_column("pnl").sum())
-        final_equity = 10_000.0 + total_pnl
-        print(json.dumps({"trades": df_trades.height, "final_equity": round(final_equity, 2)}))
-    else:
-        # Still create an empty file for consistency
-        out_path = res_dir / "trades.parquet"
-        empty = pl.DataFrame(schema={
-            "symbol": pl.Utf8,
-            "entry_idx": pl.Int64,
-            "exit_idx": pl.Int64,
-            "entry": pl.Float64,
-            "exit": pl.Float64,
-            "qty": pl.Int64,
-            "pnl": pl.Float64,
-            "entry_date": pl.Utf8,
-            "exit_date": pl.Utf8,
-        })
-        empty.write_parquet(out_path)
-        print(json.dumps({"trades": 0, "final_equity": 10_000.0}))
+def main() -> None:
+    Backtester().run()
 
 
 if __name__ == "__main__":
