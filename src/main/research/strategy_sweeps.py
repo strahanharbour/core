@@ -110,39 +110,7 @@ def _entries_from_signal(sig: pl.Series, k_edge: int) -> pl.Series:
     return (sig_b & (~prev_any)).alias("entry")
 
 
-@dataclass(frozen=True)
-class MarketFilter:
-    enabled: bool
-    symbol: str
-    sma_length: int
-
-
-def _load_market_filter() -> MarketFilter:
-    cfg = load_cfg()["cfg"]
-    sweep = ((cfg.get("strategy") or {}).get("sweep") or {})
-    mf = (sweep.get("market_filter") or {})
-    return MarketFilter(
-        enabled=bool(mf.get("enabled", False)),
-        symbol=str(mf.get("symbol", "SPY")),
-        sma_length=int(mf.get("sma_length", 50)),
-    )
-
-
-def _market_filter_series(mf: MarketFilter, data_dir: Path) -> pl.DataFrame | None:
-    if not mf.enabled:
-        return None
-    f = data_dir / f"{mf.symbol}.parquet"
-    if not f.exists():
-        return None
-    px = pl.read_parquet(f).select([Col.DATE.value, Col.CLOSE.value])
-    sma_df = px.with_columns(
-        pl.col(Col.CLOSE.value).rolling_mean(window_size=mf.sma_length, min_samples=1).alias("mkt_sma")
-    )
-    filt = sma_df.select([
-        Col.DATE.value,
-        (pl.col(Col.CLOSE.value) > pl.col("mkt_sma")).alias("mkt_ok"),
-    ])
-    return filt
+## Market filter helper lives in research/_market_filter.py using global strategy.market_filter
 
 @dataclass(frozen=True)
 class ExitKnobs:
@@ -154,8 +122,8 @@ class ExitKnobs:
 
 def _load_exit_knobs() -> ExitKnobs:
     cfg = load_cfg()["cfg"]
-    sweep = ((cfg.get("strategy") or {}).get("sweep") or {})
-    ex = (sweep.get("exits") or {})
+    strat = (cfg.get("strategy") or {})
+    ex = (strat.get("exits") or {})
     return ExitKnobs(
         enabled=bool(ex.get("enabled", False)),
         stop_atr_mult=float(ex.get("stop_atr_mult", 2.0)),
@@ -175,12 +143,32 @@ def _eval_symbol(sym: str, p: Params, knobs: SweepKnobs, data_dir: Path, feat_di
     df = feats.join(data, on=Col.DATE.value, how="left").drop_nulls([Col.CLOSE.value])
 
     sig = _signal_with_knobs(df, p, knobs)
-    # Apply market filter if configured
-    mf = _load_market_filter()
-    mkt = _market_filter_series(mf, data_dir)
-    if mkt is not None:
-        df = df.join(mkt, on=Col.DATE.value, how="left")
-        sig = (sig & df.get_column("mkt_ok").fill_null(False))
+    # Gate by Sentiment SIC if configured and available
+    try:
+        cfg = load_cfg()["cfg"]
+        sent = cfg.get("sentiment", {}) or {}
+        if bool(sent.get("enabled", False)):
+            sic_dir = feat_dir / "sentiment"
+            sic_file = sic_dir / f"{sym}_sic.parquet"
+            if sic_file.exists():
+                sic = pl.read_parquet(sic_file).select([Col.DATE.value, "sic"])
+                df = df.join(sic, on=Col.DATE.value, how="left")
+                sig = sig & (df.get_column("sic").fill_null(0.0) >= float(sent.get("sic_threshold", 0.1)))
+    except Exception:
+        # sentiment is optional; ignore issues
+        pass
+    # Apply global market filter if configured
+    try:
+        cfg = load_cfg()["cfg"]
+        mf = (cfg.get("strategy", {}).get("market_filter", {}) or {})
+        if bool(mf.get("enabled", False)):
+            from research._market_filter import load_market_ok
+            mkt = load_market_ok(data_dir, str(mf.get("symbol", "SPY")), int(mf.get("sma_length", 50)))
+            if mkt is not None:
+                df = df.join(mkt, on=Col.DATE.value, how="left")
+                sig = sig & df.get_column("mkt_ok").fill_null(False)
+    except Exception:
+        pass
     ent = _entries_from_signal(sig, knobs.entry_edge_lookback)
     exits = _load_exit_knobs()
 
@@ -253,15 +241,22 @@ def _equity_curve_for_combo(p: Params, knobs: SweepKnobs, universe: list[str], d
     cal = pl.date_range(start=start, end=end, interval="1d", eager=True).alias("date")
     daily = pl.DataFrame({"date": cal})
 
-    growth = trades.group_by("entry_date").agg(pl.sum("ret_h").alias("sum_ret")).with_columns(
-        (1.0 + pl.col("sum_ret")).alias("gf")
-    ).select(pl.col("entry_date").alias("date"), "gf")
+    growth = (
+        trades
+        .group_by("entry_date")
+        .agg(pl.sum("ret_h").alias("sum_ret"))
+        .with_columns([
+            (1.0 + pl.col("sum_ret")).alias("gf"),
+            pl.col("entry_date").dt.date().alias("date"),
+        ])
+        .select(["date", "gf"])
+    )
 
     curve = daily.join(growth, on="date", how="left").with_columns(
         pl.when(pl.col("gf").is_null()).then(1.0).otherwise(pl.col("gf")).alias("gf")
     )
     curve = curve.with_columns(
-        pl.cum_prod("gf").alias("equity")
+        pl.col("gf").cum_prod().alias("equity")
     ).select(["date", "equity"])
     curve = curve.with_columns(pl.lit(_label_for_params(p)).alias("label"))
     return curve

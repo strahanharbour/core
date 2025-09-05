@@ -63,7 +63,8 @@ def main() -> None:
     risk_dollars = float(risk.get("per_trade_dollar", 25.0))
 
     senti = cfg.get("sentiment", {})
-    use_sic = bool(senti.get("enable", False))
+    # Support both 'enabled' and legacy 'enable'
+    use_sic = bool(senti.get("enabled", senti.get("enable", False)))
     sic_threshold = float(senti.get("sic_threshold", 0.0))
 
     uni = [str(s).upper() for s in cfg.get("universe", [])]
@@ -90,6 +91,37 @@ def main() -> None:
             use_sic=use_sic,
             sic_threshold=sic_threshold,
         )
+
+        # Optional: Global market filter (strategy.market_filter)
+        try:
+            mf = (cfg.get("strategy", {}).get("market_filter", {}) or {})
+            if bool(mf.get("enabled", False)):
+                from research._market_filter import load_market_ok
+                # Prefer absolute paths from config_env
+                data_dir_for_mf = Path(paths_abs.get("data_dir") or "src/main/artifacts/local_data")
+                mkt = load_market_ok(data_dir_for_mf, str(mf.get("symbol", "SPY")), int(mf.get("sma_length", 50)))
+                if mkt is not None:
+                    df = df.join(mkt, on="date", how="left")
+                    signal = signal & df.get_column("mkt_ok").fill_null(False)
+        except Exception:
+            pass
+
+        # Optional: Gate by SIC from features/sentiment if enabled in config
+        try:
+            _cfg = load_cfg()["cfg"]
+            _sent = _cfg.get("sentiment", {}) or {}
+            _feat_dir = Path((_cfg.get("paths") or {}).get("features_dir", "src/main/artifacts/features"))
+            if bool(_sent.get("enabled", False)):
+                sic_dir = _feat_dir / "sentiment"
+                sic_file = sic_dir / f"{sym}_sic.parquet"
+                if sic_file.exists():
+                    sic = pl.read_parquet(sic_file).select(["date", "sic"])
+                    df = df.join(sic, on="date", how="left")
+                    threshold = float(_sent.get("sic_threshold", 0.1))
+                    signal = signal & (df.get_column("sic").fill_null(0.0) >= threshold)
+        except Exception:
+            # Do not break backtests if sentiment files are missing/malformed
+            pass
         # signal is a pl.Series aligned to df
         sig_series = signal if isinstance(signal, pl.Series) else pl.Series(values=signal)
         idxs = [i for i, v in enumerate(sig_series) if bool(v)]
@@ -103,55 +135,142 @@ def main() -> None:
         dates = df.get_column(Col.DATE.value)
         n = df.height
 
-        for i in idxs:
-            j = min(i + horizon_days, n - 1)
-
-            c_in = close[i]
-            c_out = close[j]
-            if c_in is None or c_out is None:
-                continue
-            try:
-                c_in_f = float(c_in)
-                c_out_f = float(c_out)
-            except Exception:
-                continue
-
-            # Get ATR for sizing; skip if missing/nonpositive
-            atr_i = None
-            if atr is not None:
-                atr_i = atr[i]
-            if atr_i is None:
-                qty = 0
-            else:
+        # Exits: ATR-based when enabled; otherwise fixed-horizon fallback
+        ex = (cfg.get("strategy", {}).get("exits", {}) or {})
+        use_atr_exits = bool(ex.get("enabled", False)) and (Col.ATR14.value in df.columns)
+        if use_atr_exits:
+            stop_k = float(ex.get("stop_atr_mult", 2.0))
+            take_k = float(ex.get("take_atr_mult", 3.0))
+            max_h  = int(ex.get("max_hold_bars", 10))
+            for i0 in idxs:
+                c_in = close[i0]
+                if c_in is None:
+                    continue
                 try:
-                    qty = int(position_size(float(atr_i), risk_dollars=risk_dollars))
+                    px0 = float(c_in)
                 except Exception:
+                    continue
+
+                # Get ATR for sizing
+                atr_i = None
+                if atr is not None:
+                    atr_i = atr[i0]
+                if atr_i is None:
                     qty = 0
-            if qty <= 0:
-                continue
+                    atr0 = None
+                else:
+                    try:
+                        atr0 = float(atr_i)
+                        qty = int(position_size(atr0, risk_dollars=risk_dollars))
+                    except Exception:
+                        qty = 0
+                        atr0 = None
+                if qty <= 0 or atr0 is None:
+                    continue
 
-            entry_price = c_in_f * (1.0 + slip)
-            exit_price = c_out_f * (1.0 - slip)
+                stop = px0 - stop_k * atr0
+                take = px0 + take_k * atr0
+                i_end = min(n - 1, i0 + max_h)
+                ret = 0.0
+                exit_idx = i_end
+                hit = False
+                for i in range(i0 + 1, i_end + 1):
+                    px = close[i]
+                    if px is None:
+                        continue
+                    try:
+                        px_f = float(px)
+                    except Exception:
+                        continue
+                    if px_f <= stop:
+                        ret = (stop / px0) - 1.0
+                        exit_idx = i
+                        hit = True
+                        break
+                    if px_f >= take:
+                        ret = (take / px0) - 1.0
+                        exit_idx = i
+                        hit = True
+                        break
+                if not hit:
+                    # exit at last bar of max_hold window
+                    px_exit = close[i_end]
+                    if px_exit is None:
+                        continue
+                    try:
+                        ret = (float(px_exit) / px0) - 1.0
+                    except Exception:
+                        continue
 
-            fees_cost = fee * entry_price * qty + fee * exit_price * qty
-            pnl = (exit_price - entry_price) * qty - fees_cost
+                # Realized prices with slippage
+                entry_price = px0 * (1.0 + slip)
+                exit_price  = px0 * (1.0 + ret) * (1.0 - slip)
+                fees_cost = fee * entry_price * qty + fee * exit_price * qty
+                pnl = (exit_price - entry_price) * qty - fees_cost
 
-            entry_date = str(dates[i])
-            exit_date = str(dates[j])
+                trades.append(
+                    {
+                        "symbol": sym,
+                        "entry_idx": i0,
+                        "exit_idx": exit_idx,
+                        "entry": entry_price,
+                        "exit": exit_price,
+                        "qty": qty,
+                        "pnl": pnl,
+                        "entry_date": str(dates[i0]),
+                        "exit_date": str(dates[exit_idx]),
+                    }
+                )
+        else:
+            for i in idxs:
+                j = min(i + horizon_days, n - 1)
 
-            trades.append(
-                {
-                    "symbol": sym,
-                    "entry_idx": i,
-                    "exit_idx": j,
-                    "entry": entry_price,
-                    "exit": exit_price,
-                    "qty": qty,
-                    "pnl": pnl,
-                    "entry_date": entry_date,
-                    "exit_date": exit_date,
-                }
-            )
+                c_in = close[i]
+                c_out = close[j]
+                if c_in is None or c_out is None:
+                    continue
+                try:
+                    c_in_f = float(c_in)
+                    c_out_f = float(c_out)
+                except Exception:
+                    continue
+
+                # Get ATR for sizing; skip if missing/nonpositive
+                atr_i = None
+                if atr is not None:
+                    atr_i = atr[i]
+                if atr_i is None:
+                    qty = 0
+                else:
+                    try:
+                        qty = int(position_size(float(atr_i), risk_dollars=risk_dollars))
+                    except Exception:
+                        qty = 0
+                if qty <= 0:
+                    continue
+
+                entry_price = c_in_f * (1.0 + slip)
+                exit_price = c_out_f * (1.0 - slip)
+
+                fees_cost = fee * entry_price * qty + fee * exit_price * qty
+                pnl = (exit_price - entry_price) * qty - fees_cost
+
+                entry_date = str(dates[i])
+                exit_date = str(dates[j])
+
+                trades.append(
+                    {
+                        "symbol": sym,
+                        "entry_idx": i,
+                        "exit_idx": j,
+                        "entry": entry_price,
+                        "exit": exit_price,
+                        "qty": qty,
+                        "pnl": pnl,
+                        "entry_date": entry_date,
+                        "exit_date": exit_date,
+                    }
+                )
 
     # Persist trades and print summary
     if trades:

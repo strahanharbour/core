@@ -12,6 +12,7 @@ pytest
 rich
 streamlit
 requests
+feedparser
 vaderSentiment
 scikit-learn
 scipy

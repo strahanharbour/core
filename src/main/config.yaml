@@ -1,4 +1,4 @@
-﻿universe:
+universe:
   - SPY
   - QQQ
   - AAPL
@@ -44,9 +44,13 @@ backtest:
   fee_bps: 1.0
   slippage_bps: 3.0
 sentiment:
-  enable: false
-  sic_threshold: 0.0
-  decay_lambda: 0.05
+  enabled: true            # ON to gate entries for backtests/sweeps
+  providers: ["finnhub", "yahoo_rss", "yfinance", "newsapi"]
+  window_days: 14
+  storage_dir: src/main/artifacts/altdata/news
+  aggregation: ewm         # or mean|median
+  ewm_span: 5
+  sic_threshold: 0.1       # gate threshold
 labels:
   enable_triple_barrier: false
   up_sigma: 2.0
@@ -63,26 +67,27 @@ features:
 portfolio:  
   enable_hrp: false
   vol_target_annual: 0.15
+  allocator: "equal"      # "equal" now; "hrp" later when signals diversify
+  max_positions: 5
 strategy:
   rsi_cross_level: 25.0
   vol_mult_min: 1.2
   macd_hist_floor: 0.0
   atr_sizing_multiple: 1.2
+  market_filter:
+    enabled: true
+    symbol: SPY
+    sma_length: 50
+  exits:
+    enabled: true
+    stop_atr_mult: 2.0
+    take_atr_mult: 3.0
+    max_hold_bars: 10
   sweep:
     lookback_bars: 5              # allow sub-signals to align within last K bars
     require_same_bar: false       # if true, all conditions must hold on same bar
-    require_macd_rising: true     # if false, drop â€œrisingâ€ check; keep > floor
+    require_macd_rising: true     # if false, drop rising check; keep > floor
     price_slack_bps: 2.0          # Close >= VWAP * (1 - slack_bps/1e4)
-    entry_edge_lookback: 3        # window for â€œnew signalâ€ edge in entries
-strategy:
-  sweep:
-    market_filter:
-      enabled: true
-      symbol: SPY
-      sma_length: 50
-    exits:
-      enabled: true
-      stop_atr_mult: 2.0
-      take_atr_mult: 3.0
-      max_hold_bars: 10
+    entry_edge_lookback: 3        # window for new signal edge in entries
+    
 

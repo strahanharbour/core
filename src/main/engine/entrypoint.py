@@ -119,45 +119,73 @@ def run(asof: Optional[str] = None, dry_run: bool = False) -> None:
     _setup_logging(paths["results"])
 
     universe = cfg.get("universe", ["SPY","QQQ","AAPL","MSFT","NVDA","TSLA"])
+    port_cfg = (cfg.get("portfolio") or {})
+    alloc = str(port_cfg.get("allocator", "equal")).lower()
+    maxn = int(port_cfg.get("max_positions", 5))
 
     oms_kind, OMSClass = _maybe_import_real_oms()
     state_dir = paths["results"] / "state"
     oms = OMSClass(state_dir) if oms_kind == "paper" else OMSClass()  # adjust if your OrderManager needs args
     logging.info(f"Entrypoint start | OMS={oms_kind} | dry_run={dry_run}")
 
+    # Collect candidate entries with a basic strength score
+    signals_rows: list[dict[str, object]] = []
+    df_by_sym: dict[str, pl.DataFrame] = {}
     for sym in universe:
         df = _latest_joined(sym, paths["features"], paths["data"])
         if df is None or df.height < 2:
             continue
-
         sig = signal_rules(df)
         entries = _strict_entry_edge(sig)
-
-        # last two rows for edge
-        last_idx = df.height - 1
         enter = bool(entries.tail(1).item())
+        # Simple strength proxy: latest macdHist if present else 0.0
+        try:
+            strength = float(df.get_column(Col.MACD_HIST.value).tail(1).item()) if Col.MACD_HIST.value in df.columns else 0.0
+        except Exception:
+            strength = 0.0
+        last_close = float(df.get_column(Col.CLOSE.value).tail(1).item())
+        signals_rows.append({"symbol": sym, "enter": enter, "strength": strength, "last_close": last_close})
+        df_by_sym[sym] = df
 
-        last_close = float(df[Col.CLOSE.value].tail(1).item())
-        if enter:
-            qty = _choose_qty(df)
-            if qty <= 0:
-                logging.info(f"{sym}: signal but qty=0 (skip)")
-                continue
-            order = PaperOrder(symbol=sym, side="BUY", qty=qty, price=last_close, note="entry-on-signal")
-            if dry_run:
-                logging.info(f"DRY RUN order: {order}")
-            else:
-                if oms_kind == "paper":
-                    oms.place(order)  # PaperOMS
-                else:
-                    # Adapt to your real OMS API if present
-                    try:
-                        oms.place_order(symbol=sym, side="BUY", quantity=qty, price=last_close)  # type: ignore
-                    except Exception:
-                        # last resort: log
-                        logging.info(f"{sym}: real OMS not wired; logging only: {order}")
+    signals_df = pl.DataFrame(signals_rows) if signals_rows else pl.DataFrame({"symbol": [], "enter": [], "strength": [], "last_close": []})
+    candidates = signals_df.filter(pl.col("enter") == True) if signals_df.height > 0 else signals_df
+    if candidates.is_empty():
+        logging.info("No entry signals across universe.")
+        logging.info("Entrypoint complete.")
+        return
+
+    picks = candidates.sort(by="strength", descending=True).head(maxn)
+    if alloc == "equal" or alloc not in ("hrp",):
+        w = 1.0 / max(1, picks.height)
+        picks = picks.with_columns(pl.lit(w).alias("weight"))
+    elif alloc == "hrp":
+        # Placeholder: map to equal weight until HRP pipeline is wired
+        w = 1.0 / max(1, picks.height)
+        picks = picks.with_columns(pl.lit(w).alias("weight"))
+
+    # Place orders for picks
+    for row in picks.iter_rows(named=True):
+        sym = str(row["symbol"]).upper()
+        df = df_by_sym.get(sym)
+        if df is None:
+            continue
+        qty = _choose_qty(df)
+        if qty <= 0:
+            logging.info(f"{sym}: weight={row.get('weight', 0.0):.3f} but qty=0 (skip)")
+            continue
+        last_close = float(row["last_close"]) if row["last_close"] is not None else float(df.get_column(Col.CLOSE.value).tail(1).item())
+        note = f"entry-on-signal weight={row.get('weight', 0.0):.3f} alloc={alloc}"
+        order = PaperOrder(symbol=sym, side="BUY", qty=qty, price=last_close, note=note)
+        if dry_run:
+            logging.info(f"DRY RUN order: {order}")
         else:
-            logging.info(f"{sym}: no entry")
+            if oms_kind == "paper":
+                oms.place(order)  # PaperOMS
+            else:
+                try:
+                    oms.place_order(symbol=sym, side="BUY", quantity=qty, price=last_close)  # type: ignore
+                except Exception:
+                    logging.info(f"{sym}: real OMS not wired; logging only: {order}")
 
     logging.info("Entrypoint complete.")
 
@@ -167,4 +195,3 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true", help="Log actions without placing orders")
     args = parser.parse_args()
     run(asof=args.asof, dry_run=args.dry_run)
-
