@@ -7,7 +7,7 @@ from typing import Optional
 
 import pandas as pd
 
-from config_env import load_cfg
+from main.config_env import load_cfg
 
 
 def _sqlite_path() -> Path:

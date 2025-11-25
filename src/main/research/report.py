@@ -8,7 +8,7 @@ from typing import Dict
 import polars as pl
 import plotly.graph_objects as go
 
-from config_env import load_cfg
+from main.config_env import load_cfg
 
 
 logger = logging.getLogger(__name__)

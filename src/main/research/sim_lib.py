@@ -5,9 +5,9 @@ from typing import Optional, Tuple
 
 import polars as pl
 
-from config_env import load_cfg
-from constants import Col
-from engine.strategy import signal_rules
+from main.config_env import load_cfg
+from main.constants import Col
+from main.engine.strategy import signal_rules
 
 
 def load_cfg_bits():
@@ -116,8 +116,28 @@ __all__ = [
     "load_cfg_bits",
     "apply_sentiment_gate",
     "apply_market_filter",
+    "apply_regime_gate",
     "strict_entry_edge",
     "exits_returns",
     "signal_rules",
 ]
 
+def apply_regime_gate(df: pl.DataFrame, sig: pl.Series, data_dir: Path, strat_cfg: dict) -> pl.Series:
+    rf = (strat_cfg.get("regime_filter") or {})
+    if not bool(rf.get("enabled", False)):
+        return sig
+    from main.research.regime import compute_regime
+
+    sym = str(rf.get("symbol", "SPY"))
+    f = data_dir / f"{sym}.parquet"
+    if not f.exists():
+        return sig
+    px = pl.read_parquet(f).select([Col.DATE.value, Col.CLOSE.value])
+    reg = compute_regime(
+        px,
+        int(rf.get("sma_length", 50)),
+        int(rf.get("vol_length", 20)),
+        float(rf.get("vol_thresh", 0.02)),
+    )
+    df2 = df.join(reg, on="date", how="left")
+    return sig & df2.get_column("bull").fill_null(False)

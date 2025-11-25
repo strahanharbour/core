@@ -12,12 +12,13 @@ from typing import Any, Dict, Iterable, List
 
 import polars as pl
 
-from config_env import load_cfg
-from constants import Col
-from research.sim_lib import (
+from main.config_env import load_cfg
+from main.constants import Col
+from main.research.sim_lib import (
     load_cfg_bits,
     apply_sentiment_gate,
     apply_market_filter,
+    apply_regime_gate,
     strict_entry_edge,
     exits_returns,
 )
@@ -171,6 +172,7 @@ def _eval_symbol(sym: str, p: Params, knobs: SweepKnobs, data_dir: Path, feat_di
     _, paths_cfg, sent_cfg, strat_cfg = load_cfg_bits()
     sig = apply_sentiment_gate(df, sig, sym, feat_dir, sent_cfg)
     sig = apply_market_filter(df, sig, data_dir, strat_cfg)
+    sig = apply_regime_gate(df, sig, data_dir, strat_cfg)
     # Strict entry edge for consistency with backtest
     ent = strict_entry_edge(sig)
     # Compute returns using shared exits
@@ -311,7 +313,7 @@ class StrategySweeper:
 
     def _rank(self) -> None:
         try:
-            from research.rank_strategies import StrategyRanker
+            from main.research.rank_strategies import StrategyRanker
 
             ranked = StrategyRanker(self.results_dir).rank()
             out_rank_csv = self.results_dir / "ranked_strategies.csv"

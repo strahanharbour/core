@@ -6,8 +6,8 @@ from typing import List
 
 import polars as pl
 
-from config_env import load_cfg
-from constants import Col
+from main.config_env import load_cfg
+from main.constants import Col
 
 
 def _features_dir() -> Path:

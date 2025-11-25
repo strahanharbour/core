@@ -7,20 +7,21 @@ from typing import Dict, List
 
 import polars as pl
 
-from config_env import load_cfg
-from engine.strategy import position_size
-from utils.paths import get_paths
-from utils.polars_ext import join_on_date
-from research.sim_lib import (
+from main.config_env import load_cfg
+from main.engine.strategy import position_size
+from main.utils.paths import get_paths
+from main.utils.polars_ext import join_on_date
+from main.research.sim_lib import (
     load_cfg_bits,
     apply_sentiment_gate,
     apply_market_filter,
+    apply_regime_gate,
     strict_entry_edge,
     exits_returns,
     signal_rules,
 )
-from constants import Col
-from utils.columns import canonicalize_polars_columns
+from main.constants import Col
+from main.utils.columns import canonicalize_polars_columns
 
 
 logger = logging.getLogger(__name__)
@@ -139,6 +140,17 @@ class Backtester:
             data_dir_for_mf = Path(self.paths_cfg.get("data_dir", str(self.paths.data)))
             sig = apply_sentiment_gate(df, sig, sym, features_dir, self.sent_cfg)
             sig = apply_market_filter(df, sig, data_dir_for_mf, self.strat_cfg)
+            sig = apply_regime_gate(df, sig, data_dir_for_mf, self.strat_cfg)
+            # Optional meta-label gate (triple-barrier acceptance)
+            ml = (self.cfg.get("metalabel") or {})
+            if bool(ml.get("enabled", False)):
+                feat_dir = Path(self.paths_cfg.get("features_dir", str(self.paths.features)))
+                lab_file = feat_dir / "labels" / f"{sym}_labels.parquet"
+                if lab_file.exists():
+                    lab = pl.read_parquet(lab_file).select(["date", "label"])
+                    df = df.join(lab, on="date", how="left")
+                    accept = set(ml.get("accept", [1]))
+                    sig = sig & df.get_column("label").is_in(list(accept)).fill_null(False)
             entries = strict_entry_edge(sig)
             trades_df = exits_returns(df, entries, self.strat_cfg)
             if trades_df is None or trades_df.is_empty():

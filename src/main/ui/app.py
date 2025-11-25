@@ -6,7 +6,7 @@ from typing import Dict
 import polars as pl
 import streamlit as st
 
-from config_env import load_cfg
+from main.config_env import load_cfg
 
 
 st.set_page_config(page_title="Core Research UI", layout="wide")
@@ -70,4 +70,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

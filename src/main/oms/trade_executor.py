@@ -5,8 +5,8 @@ import random
 from dataclasses import dataclass
 from typing import Optional
 
-from oms.db_manager import DBManager
-from engine.execution.policy import slippage_estimate
+from .db_manager import DBManager
+from ..engine.execution.policy import slippage_estimate
 
 
 def _seed_maybe() -> None:
@@ -56,4 +56,3 @@ class TradeExecutor:
 
 
 __all__ = ["TradeExecutor"]
-

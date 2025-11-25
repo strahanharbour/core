@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from config_env import load_cfg
+from main.config_env import load_cfg
 
 
 @dataclass(frozen=True)
@@ -30,4 +30,3 @@ def get_paths() -> Paths:
 
 
 __all__ = ["Paths", "get_paths"]
-

@@ -6,7 +6,7 @@ from typing import Dict, Iterable, List, Optional
 
 import requests
 
-from config_env import load_cfg
+from main.config_env import load_cfg
 
 
 logger = logging.getLogger(__name__)
@@ -84,4 +84,3 @@ def fetch_news(
 
 
 __all__ = ["fetch_news"]
-

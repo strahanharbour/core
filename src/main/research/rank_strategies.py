@@ -52,8 +52,8 @@ def load_sweep_results(results_dir: Path) -> pl.DataFrame:
 # We reuse the logic already in strategy_sweeps via a small import (no code duplication).
 def build_curves_for_all(results_dir: Path) -> pl.DataFrame:
     try:
-        from research.strategy_sweeps import _equity_curve_for_combo, Params, _load_knobs
-        from config_env import load_cfg
+        from main.research.strategy_sweeps import _equity_curve_for_combo, Params, _load_knobs
+        from main.config_env import load_cfg
 
         cfg = load_cfg()["cfg"]
         paths = cfg.get("paths", {}) or {}

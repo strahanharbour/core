@@ -70,7 +70,7 @@ portfolio:
   allocator: "equal"      # "equal" now; "hrp" later when signals diversify
   max_positions: 5
 strategy:
-  rsi_cross_level: 25.0
+  rsi_cross_level: 30.0
   vol_mult_min: 1.2
   macd_hist_floor: 0.0
   atr_sizing_multiple: 1.2
@@ -83,11 +83,24 @@ strategy:
     stop_atr_mult: 2.0
     take_atr_mult: 3.0
     max_hold_bars: 10
+  regime_filter:
+    enabled: false
+    symbol: SPY
+    sma_length: 50
+    vol_length: 20
+    vol_thresh: 0.02
   sweep:
     lookback_bars: 5              # allow sub-signals to align within last K bars
     require_same_bar: false       # if true, all conditions must hold on same bar
     require_macd_rising: true     # if false, drop rising check; keep > floor
     price_slack_bps: 2.0          # Close >= VWAP * (1 - slack_bps/1e4)
     entry_edge_lookback: 3        # window for new signal edge in entries
-    
+
+metalabel:
+  enabled: false
+  upper_pct: 0.02
+  lower_pct: 0.02
+  max_hold_bars: 10
+  accept: [1]
+
 

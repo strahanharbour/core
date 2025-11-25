@@ -5,13 +5,13 @@ from typing import Dict, List
 
 import pandas as pd
 
-from config_env import load_cfg
-from data.market.extractor import DataExtractor
-from data.pipelines.transformer import DataTransformer
-from data.pipelines.loader_sqlite import DataLoader
-from engine.risk.manager import RiskManager
-from oms import DBManager, OrderManager, TradeExecutor, PortfolioManager
-from constants import Col
+from main.config_env import load_cfg
+from main.data.market.extractor import DataExtractor
+from main.data.pipelines.transformer import DataTransformer
+from main.data.pipelines.loader_sqlite import DataLoader
+from main.engine.risk.manager import RiskManager
+from main.oms import DBManager, OrderManager, TradeExecutor, PortfolioManager
+from main.constants import Col
 
 
 START = "2022-01-01"

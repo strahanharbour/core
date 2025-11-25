@@ -5,7 +5,7 @@ from typing import Dict, List, Optional
 
 import polars as pl
 
-from oms.db_manager import DBManager
+from .db_manager import DBManager
 
 
 @dataclass
@@ -44,4 +44,3 @@ class PortfolioManager:
 
 
 __all__ = ["PortfolioManager"]
-

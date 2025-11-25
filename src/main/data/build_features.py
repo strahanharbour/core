@@ -7,9 +7,9 @@ import re
 
 import polars as pl
 
-from config_env import load_cfg
-from constants import Col
-from utils.columns import canonicalize_polars_columns
+from main.config_env import load_cfg
+from main.constants import Col
+from main.utils.columns import canonicalize_polars_columns
 
 
 logger = logging.getLogger(__name__)

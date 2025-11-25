@@ -9,9 +9,10 @@ import pytest
 # Make src/main importable before tests are collected
 here = Path(__file__).resolve()
 repo_root = here.parents[2]
-src_main = repo_root / "src" / "main"
-if str(src_main) not in sys.path:
-    sys.path.insert(0, str(src_main))
+# Ensure `src` is on sys.path so `import main.*` works
+src_dir = repo_root / "src"
+if str(src_dir) not in sys.path:
+    sys.path.insert(0, str(src_dir))
 
 
 @pytest.fixture(autouse=True, scope="session")

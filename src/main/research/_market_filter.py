@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import polars as pl
 
-from constants import Col
+from main.constants import Col
 
 
 def load_market_ok(data_dir: Path, symbol: str, sma_len: int) -> pl.DataFrame | None:
@@ -24,4 +24,3 @@ def load_market_ok(data_dir: Path, symbol: str, sma_len: int) -> pl.DataFrame | 
 
 
 __all__ = ["load_market_ok"]
-

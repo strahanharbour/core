@@ -2,14 +2,15 @@ from __future__ import annotations
 import argparse, json, logging, os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Protocol, runtime_checkable, Literal, Union, cast
+from typing import Any, Dict, Optional, Protocol, runtime_checkable, Literal, Union, cast, TypedDict
 
 import polars as pl
 
-from config_env import load_cfg
-from constants import Col
-from engine.strategy import signal_rules, position_size
-from constants import AllocatorType
+from main.config_env import load_cfg
+from main.constants import Col
+from main.engine.strategy import signal_rules, position_size
+from main.constants import AllocatorType
+from main.utils.paths import get_paths
 
 # -------- logging --------
 def _setup_logging(results_dir: Path) -> None:
@@ -66,6 +67,41 @@ class PaperOMS:
         logging.info(f"FILLED (paper): {fill}")
         return fill
 
+# -------- persisted state helpers --------
+def _state_file(results_dir: Path, name: str) -> Path:
+    sdir = results_dir / "state"
+    sdir.mkdir(parents=True, exist_ok=True)
+    return sdir / name
+
+
+def _load_float(p: Path, default: float = 0.0) -> float:
+    try:
+        return float(p.read_text().strip())
+    except Exception:
+        return default
+
+
+def _save_float(p: Path, val: float) -> None:
+    p.write_text(f"{float(val):.6f}", encoding="utf-8")
+
+
+def _estimate_gross_exposure(pos_json: Path, last_prices: dict[str, float]) -> float:
+    import json as _json
+    if not pos_json.exists():
+        return 0.0
+    try:
+        pos = _json.loads(pos_json.read_text() or "{}")
+    except Exception:
+        return 0.0
+    gross = 0.0
+    for sym, qty in pos.items():
+        try:
+            px = float(last_prices.get(sym, 0.0))
+            gross += abs(float(qty)) * px
+        except Exception:
+            continue
+    return gross
+
 # ---- OMS Protocols (typing) ----
 @runtime_checkable
 class _PaperOMSProto(Protocol):
@@ -78,11 +114,9 @@ class _RealOMSProto(Protocol):
 
 # -------- helpers --------
 def _load_cfg_paths(cfg: Dict[str, Any]) -> Dict[str, Path]:
-    paths = cfg.get("paths", {}) or {}
-    data_dir = Path(paths.get("data_dir", "src/main/artifacts/local_data"))
-    feat_dir = Path(paths.get("features_dir", "src/main/artifacts/features"))
-    results_dir = Path(paths.get("results_dir", "src/main/artifacts/results"))
-    return {"data": data_dir, "features": feat_dir, "results": results_dir}
+    """DEPRECATED: use get_paths(). Kept for backward compat (unused)."""
+    p = get_paths()
+    return {"data": p.data, "features": p.features, "results": p.results}
 
 def _latest_joined(sym: str, feat_dir: Path, data_dir: Path) -> Optional[pl.DataFrame]:
     f_feat = feat_dir / f"{sym}_features.parquet"
@@ -113,21 +147,22 @@ def _choose_qty(df: pl.DataFrame, risk_dollars: Optional[float] = None) -> int:
         return max(qty, 0)
     return 1  # ultra-conservative fallback
 
+def _select_positions(candidates, max_positions: int) -> list:
+    """Sort candidates by edge desc and take top-N.
+
+    candidates: list of dicts {symbol, edge (float), last_close, df}
+    """
+    return sorted(candidates, key=lambda x: x["edge"], reverse=True)[: max(0, int(max_positions))]
 def _build_oms(results_dir: Path) -> tuple[Literal["om", "paper"], Union[_RealOMSProto, _PaperOMSProto]]:
     """Return an instantiated OMS. Prefer real OrderManager; fallback to PaperOMS.
 
     This avoids type-checker confusion over constructor signatures.
     """
-    # Try canonical package path first, then local import fallback
+    # Try canonical package path; fallback to paper OMS if real OMS import fails
     try:
-        try:
-            from oms.order_manager import OrderManager  # type: ignore
-            from oms.db_manager import DBManager  # type: ignore
-            from engine.risk.manager import RiskManager  # type: ignore
-        except Exception:
-            from order_manager import OrderManager  # type: ignore
-            from db_manager import DBManager  # type: ignore
-            from engine.risk.manager import RiskManager  # type: ignore
+        from main.oms.order_manager import OrderManager  # type: ignore
+        from main.oms.db_manager import DBManager  # type: ignore
+        from main.engine.risk.manager import RiskManager  # type: ignore
         db = DBManager()
         risk = RiskManager()
         return ("om", cast(_RealOMSProto, OrderManager(db=db, risk=risk)))
@@ -136,26 +171,40 @@ def _build_oms(results_dir: Path) -> tuple[Literal["om", "paper"], Union[_RealOM
         return ("paper", cast(_PaperOMSProto, PaperOMS(state_dir)))
 
 # -------- main run --------
+class Candidate(TypedDict):
+    symbol: str
+    edge: float
+    last_close: float
+    df: pl.DataFrame
+
+
 def run(asof: Optional[str] = None, dry_run: bool = False) -> None:
     meta = load_cfg()
     cfg  = meta.get("cfg", {}) or {}
-    paths = _load_cfg_paths(cfg)
+    # Use absolute, resolved artifact paths rooted under src/main via config_env
+    p = get_paths()
+    paths: Dict[str, Path] = {"data": p.data, "features": p.features, "results": p.results}
     _setup_logging(paths["results"])
 
     universe = cfg.get("universe", ["SPY","QQQ","AAPL","MSFT","NVDA","TSLA"])
-    port_cfg = (cfg.get("portfolio") or {})
-    try:
-        alloc = AllocatorType(str(port_cfg.get("allocator", "equal")).lower())
-    except Exception:
-        alloc = AllocatorType.EQUAL
-    maxn = int(port_cfg.get("max_positions", 5))
+    # Rails + limits
+    risk_cfg = (cfg.get("risk") or {})
+    max_positions = int(risk_cfg.get("max_positions", 4))
+    daily_limit_pct = float(risk_cfg.get("daily_loss_limit_pct", 2.0))
+    max_gross_exposure = float(risk_cfg.get("max_gross_exposure", 0.6))
+
+    # Naive equity tracking via persisted state (placeholder)
+    eq_file = _state_file(paths["results"], "equity.txt")
+    pnl_file = _state_file(paths["results"], "pnl_today.txt")
+    equity = _load_float(eq_file, 10_000.0)
+    pnl_today = _load_float(pnl_file, 0.0)
+    limit_abs = equity * (daily_limit_pct / 100.0)
 
     oms_kind, oms = _build_oms(paths["results"])  # already instantiated
     logging.info(f"Entrypoint start | OMS={oms_kind} | dry_run={dry_run}")
 
-    # Collect candidate entries with a basic strength score
-    signals_rows: list[dict[str, object]] = []
-    df_by_sym: dict[str, pl.DataFrame] = {}
+    # Collect candidate entries first
+    candidates: list[Candidate] = []
     for sym in universe:
         df = _latest_joined(sym, paths["features"], paths["data"])
         if df is None or df.height < 2:
@@ -163,54 +212,70 @@ def run(asof: Optional[str] = None, dry_run: bool = False) -> None:
         sig = signal_rules(df)
         entries = _strict_entry_edge(sig)
         enter = bool(entries.tail(1).item())
-        # Simple strength proxy: latest macdHist if present else 0.0
-        try:
-            strength = float(df.get_column(Col.MACD_HIST.value).tail(1).item()) if Col.MACD_HIST.value in df.columns else 0.0
-        except Exception:
-            strength = 0.0
+        if not enter:
+            logging.info(f"{sym}: no entry")
+            continue
         last_close = float(df.get_column(Col.CLOSE.value).tail(1).item())
-        signals_rows.append({"symbol": sym, "enter": enter, "strength": strength, "last_close": last_close})
-        df_by_sym[sym] = df
+        edge = float(df.get_column(Col.MACD_HIST.value).tail(1).item()) if Col.MACD_HIST.value in df.columns else 0.0
+        candidates.append(Candidate(symbol=sym, edge=float(edge), last_close=float(last_close), df=df))
 
-    signals_df = pl.DataFrame(signals_rows) if signals_rows else pl.DataFrame({"symbol": [], "enter": [], "strength": [], "last_close": []})
-    candidates = signals_df.filter(pl.col("enter") == True) if signals_df.height > 0 else signals_df
-    if candidates.is_empty():
-        logging.info("No entry signals across universe.")
+    picks = _select_positions(candidates, max_positions)
+    if not picks:
+        logging.info("No candidates selected.")
         logging.info("Entrypoint complete.")
         return
 
-    picks = candidates.sort(by="strength", descending=True).head(maxn)
-    if alloc == AllocatorType.EQUAL:
-        w = 1.0 / max(1, picks.height)
-        picks = picks.with_columns(pl.lit(w).alias("weight"))
-    elif alloc == AllocatorType.HRP:
-        # Placeholder: map to equal weight until HRP pipeline is wired
-        w = 1.0 / max(1, picks.height)
-        picks = picks.with_columns(pl.lit(w).alias("weight"))
+    # ---- Enforce daily loss circuit breaker and gross exposure cap ----
+    last_prices: dict[str, float] = {str(c["symbol"]): float(c["last_close"]) for c in candidates}
+    pos_path = paths["results"] / "state" / "positions.json"
+    gross_now = _estimate_gross_exposure(pos_path, last_prices)
 
-    # Place orders for picks
-    for row in picks.iter_rows(named=True):
-        sym = str(row["symbol"]).upper()
-        df = df_by_sym.get(sym)
-        if df is None:
-            continue
-        qty = _choose_qty(df)
+    if pnl_today <= -limit_abs:
+        logging.warning(
+            f"CIRCUIT BREAKER: daily loss {pnl_today:.2f} <= -{limit_abs:.2f} (limit {daily_limit_pct}%). No new orders."
+        )
+        return
+
+    est_new_exposure = gross_now + sum(float(c["last_close"]) for c in picks)
+    if (est_new_exposure / max(equity, 1.0)) > max_gross_exposure:
+        logging.warning(
+            f"EXPOSURE CAP: est gross {(est_new_exposure/equity):.2%} exceeds {max_gross_exposure:.0%}. Trimming picks."
+        )
+        tmp: list[Candidate] = []
+        running = gross_now
+        for c in picks:
+            nxt = running + float(c["last_close"])  # type: ignore[index]
+            if (nxt / max(equity, 1.0)) <= max_gross_exposure:
+                tmp.append(c)
+                running = nxt
+        picks = tmp
+        if not picks:
+            logging.warning("No room under exposure cap; skip today.")
+            return
+    w = 1.0 / len(picks)
+    for c in picks:
+        sym = str(c["symbol"]).upper()
+        df = c["df"]  # type: ignore[assignment]
+        qty = _choose_qty(df)  # ATR-based sanity cap
         if qty <= 0:
-            logging.info(f"{sym}: weight={row.get('weight', 0.0):.3f} but qty=0 (skip)")
+            logging.info(f"{sym}: skip qty=0")
             continue
-        last_close = float(row["last_close"]) if row["last_close"] is not None else float(df.get_column(Col.CLOSE.value).tail(1).item())
-        note = f"entry-on-signal weight={row.get('weight', 0.0):.3f} alloc={alloc.value}"
-        order = PaperOrder(symbol=sym, side="BUY", qty=qty, price=last_close, note=note)
+        note = f"equal_w={w:.2f}"
+        order = PaperOrder(symbol=sym, side="BUY", qty=qty, price=float(c["last_close"]), note=note)
         if dry_run:
             logging.info(f"DRY RUN order: {order}")
         else:
             if oms_kind == "paper":
-                cast(_PaperOMSProto, oms).place(order)  # PaperOMS
+                cast(_PaperOMSProto, oms).place(order)
             else:
                 try:
-                    cast(_RealOMSProto, oms).create_order(symbol=sym, side="BUY", qty=qty, price=last_close, note=note)
+                    cast(_RealOMSProto, oms).create_order(symbol=sym, side="BUY", qty=qty, price=float(c["last_close"]), note=note)
                 except Exception:
                     logging.info(f"{sym}: real OMS not wired; logging only: {order}")
+
+    # Persist current equity / pnl_today placeholders (hook to live PnL later)
+    _save_float(eq_file, equity)
+    _save_float(pnl_file, pnl_today)
 
     logging.info("Entrypoint complete.")
 

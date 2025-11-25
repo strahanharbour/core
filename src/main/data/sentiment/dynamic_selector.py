@@ -5,7 +5,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Sequence, Set
 
-from config_env import load_cfg
+from main.config_env import load_cfg
 from .score_vader import score_vader
 from .news_extractor import fetch_news
 
@@ -81,4 +81,3 @@ def select_symbols(n_top: int = 5, seed: Iterable[str] | None = None) -> List[st
 
 
 __all__ = ["select_symbols", "rank_symbols_by_sentiment", "SEED_SYMBOLS"]
-

@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from oms.db_manager import DBManager
-from engine.risk.manager import RiskManager
+from .db_manager import DBManager
+from ..engine.risk.manager import RiskManager
 
 
 @dataclass
@@ -36,4 +36,3 @@ class OrderManager:
 
 
 __all__ = ["OrderManager"]
-

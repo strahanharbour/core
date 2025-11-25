@@ -7,8 +7,8 @@ from typing import Dict, List
 import polars as pl
 import pandas as pd
 
-from config_env import load_cfg
-from data.sentiment.score_vader import score_vader
+from main.config_env import load_cfg
+from main.data.sentiment.score_vader import score_vader
 
 
 logger = logging.getLogger(__name__)

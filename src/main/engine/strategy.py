@@ -5,8 +5,8 @@ from typing import Any, Iterable
 from functools import lru_cache
 
 import numpy as np
-from constants import Col
-from config_env import load_cfg
+from main.constants import Col
+from main.config_env import load_cfg
 
 import polars as pl
 
@@ -77,20 +77,29 @@ def signal_rules(df: Any) -> Any:
         price_ok = close >= (vwap * slack)
         vol_ok   = volm >= vol_mult_min
 
+        # materialize condition columns to ensure rolling works reliably
+        df2 = df.with_row_index("_row").with_columns([
+            cross_up.alias("_cross_up"),
+            macd_ok.fill_null(False).alias("_macd_ok"),
+            price_ok.fill_null(False).alias("_price_ok"),
+            vol_ok.fill_null(False).alias("_vol_ok"),
+        ])
+
         if same_bar:
-            base = cross_up & macd_ok & price_ok & vol_ok
+            base_expr = pl.col("_cross_up") & pl.col("_macd_ok") & pl.col("_price_ok") & pl.col("_vol_ok")
         else:
             # allow any of last K bars (rolling OR)
-            cross_up_k = cross_up.rolling_max(window_size=k).cast(pl.Boolean)
-            macd_ok_k  = macd_ok.rolling_max(window_size=k).cast(pl.Boolean)
-            price_ok_k = price_ok.rolling_max(window_size=k).cast(pl.Boolean)
-            vol_ok_k   = vol_ok.rolling_max(window_size=k).cast(pl.Boolean)
-            base = cross_up_k & macd_ok_k & price_ok_k & vol_ok_k
+            base_expr = (
+                pl.col("_cross_up").cast(pl.Int8).rolling_max(window_size=k).cast(pl.Boolean)
+                & pl.col("_macd_ok").cast(pl.Int8).rolling_max(window_size=k).cast(pl.Boolean)
+                & pl.col("_price_ok").cast(pl.Int8).rolling_max(window_size=k).cast(pl.Boolean)
+                & pl.col("_vol_ok").cast(pl.Int8).rolling_max(window_size=k).cast(pl.Boolean)
+            )
 
-        warm = max(30, k)
-        idx  = pl.arange(0, pl.len())
-        expr = (base & (idx >= warm)).alias("signal")
-        return df.with_columns(expr).get_column("signal").fill_null(False)
+        n = int(df2.height)
+        warm = min(max(30, k), max(0, n - 1))
+        expr = pl.when(pl.col("_row") >= warm).then(base_expr).otherwise(pl.lit(False)).alias("signal")
+        return df2.with_columns(expr).get_column("signal").fill_null(False)
 
     # --- Pandas branch ---
     if _is_pandas_df(df):
@@ -116,7 +125,8 @@ def signal_rules(df: Any) -> Any:
                 & vol_ok.rolling(k).max().astype(bool)
             )
 
-        warm = max(30, k)
+        n = len(df)
+        warm = min(max(30, k), max(0, n - 1))
         sig.iloc[:warm] = False
         return sig.fillna(False)
 
@@ -152,7 +162,8 @@ def signal_rules(df: Any) -> Any:
 
         base = roll_or(cross_up, k) & roll_or(macd_ok, k) & roll_or(price_ok, k) & roll_or(vol_ok, k)
 
-    warm = max(30, k)
+    n = len(df)
+    warm = min(max(30, k), max(0, n - 1))
     base[:warm] = False
     return base.tolist()
 

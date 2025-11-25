@@ -80,6 +80,12 @@ Streamlit UI:
 streamlit run src/main/ui/app.py
 ```
 
+### Walk-forward validation
+```powershell
+$env:PYTHONPATH = (Resolve-Path .\src\main).Path
+\.venv\Scripts\python.exe -m research.walk_forward
+```
+
 ## Notes
 
 - Universe, paths, and parameters live in `src/main/config.yaml`.

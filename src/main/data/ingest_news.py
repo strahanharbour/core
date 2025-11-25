@@ -17,7 +17,7 @@ try:
 except Exception:
     yf = None
 
-from config_env import load_cfg
+from main.config_env import load_cfg
 
 # ----------------- utils -----------------
 def _clean_text(s: str) -> str:
