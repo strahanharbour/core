@@ -37,3 +37,20 @@ all: data features backtest report
 
 clean:
 	@rm -rf "$(VENV)"
+
+# --- Additive targets for meta workflow and tooling ---
+.PHONY: meta bt_meta lint format
+
+meta: venv
+	@"$(PY)" -m training.labels_make && "$(PY)" -m training.meta_train
+
+bt_meta: venv
+	@"$(PY)" -m research.backtest_meta
+
+lint:
+	@flake8 .
+	@mypy --ignore-missing-imports .
+
+format:
+	@black .
+	@isort .
